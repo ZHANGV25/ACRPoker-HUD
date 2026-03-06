@@ -1,67 +1,109 @@
-# ACR Poker OCR Pipeline - Progress
+# ACR Poker OCR + GTO Solver Pipeline
 
 ## Architecture
-- Mac captures screenshots of ACR Poker tables
-- OCR pipeline extracts game state (stacks, pot, actions, cards)
-- Game state sent as JSON over ZeroMQ to PC for GTO solving
+```
+Mac (this machine)                    Windows PC
+==================                    ==========
+ACR Poker window
+    |
+    v
+capture.py ---- screenshot ----+
+    |                           |
+    v                           v
+pipeline.py (orchestrator)    card_id.py (board + hero cards)
+    |                           |
+    v                           v
+vision_ocr.py (stacks,        regions.py (ratio-based coords)
+ pot, actions, bets)
+    |
+    v
+game_state.py --- GameState JSON ---> ZeroMQ ---> solver_bridge.py
+                                                      |
+                                                      v
+                                                  range_lookup.py (preflop ranges)
+                                                  action_history.py (reconstruct sequence)
+                                                      |
+                                                      v
+                                                  solver-cli (Rust, wraps postflop-solver)
+                                                      |
+                                                      v
+                                              strategy JSON <--- ZeroMQ <--- back to Mac
+```
 
-## Current Status
-Pipeline reads screenshots and outputs structured game state JSON with card identification.
+## Phase 0: Mac OCR Pipeline -- COMPLETE
+**79 tests, all passing.**
 
-### Working
-- macOS Vision OCR for text recognition (replaced Tesseract - much better)
-- Pot total reading (BB mode)
-- Stack reading for most seats
-- Action label reading (F, R, C, R/B, etc.)
-- Action button parsing (Fold/Call/Check/Raise + amounts)
-- Hand strength text
-- **Board card identification (rank + suit)** via template matching + color/shape analysis
-- **Hero card identification (rank + suit)** — same approach
-- Street inference from board card count
-- Game state model with position inference
-- ZeroMQ network layer (PUB/SUB)
+| Component | File | Status |
+|-----------|------|--------|
+| Window capture (Quartz API) | `src/capture.py` | Done |
+| Vision OCR (stacks, pot, actions, bets) | `src/vision_ocr.py` | Done |
+| Card ID (board + hero, all 13 ranks) | `src/card_id.py` | Done |
+| 4-color deck support | `src/card_id.py` | Done |
+| Dealer button detection | `src/card_id.py` | Done |
+| Game state model + position inference | `src/game_state.py` | Done |
+| Full pipeline (screenshot -> GameState) | `src/pipeline.py` | Done |
+| ZeroMQ publisher (Mac -> PC) | `src/network.py` | Done |
+| Live capture loop (detect hero's turn) | `src/live.py` | Done |
 
-### Card Identification System
-- Template matching for rank (templates in `templates/card_ranks/`)
-  - Current templates: 2, 3, 7, 9, J (need 4, 5, 6, 8, T, Q, K, A)
-  - HSV-based text extraction handles both red and black rank text
-- Color analysis for red/black suit distinction
-- Shape analysis for specific suit:
-  - Hearts vs Diamonds: width ratio at top vs middle
-  - Clubs vs Spades: pixel group count at 35-45% height (clubs have 3 separate lobes)
+## Phase 1: Preflop Range Lookup Table -- NOT STARTED
+- Encode ~35 GTO 6-max cash ranges from FreeBetRange into JSON
+- PioSOLVER-compatible format: "AA,KK,QQ,AKs,AKo,AQs:0.5,..."
+- Scenarios: RFI per position, call/3bet vs each position
+- File: `solver/ranges.json`
 
-### Known Issues
-- Decimal points lost in small text (4.5 BB -> 45 in action buttons)
-- Font "3" sometimes misread as "2" by Vision OCR (330.5 -> 2230.5) — stacks affected
-- Some seat regions don't align across different window sizes
-- Action labels only detected for some seats (region alignment)
-- Missing card rank templates (4, 5, 6, 8, T, Q, K, A) — will be added from more screenshots
+## Phase 2: Action Sequence Reconstruction -- NOT STARTED
+- Map dealer_seat + action labels -> ordered preflop/postflop history
+- Determine IP vs OOP players for solver
+- Infer bet sizes from current_bet_bb per player
+- File: `solver/action_history.py`
 
-### Next Steps
-1. Dealer button detection (agent working on this)
-2. Live capture integration (agent working on this)
-3. Region auto-calibration (detect table layout dynamically)
-4. Multi-table support
-5. Solver integration on PC side (TexasSolver)
-6. Preflop lookup tables
+## Phase 3: Rust Solver CLI -- NOT STARTED
+- Wrap b-inary/postflop-solver in a CLI binary
+- Input: JSON (board, ranges, pot, stacks, bet sizes)
+- Output: JSON (action frequencies + EV for hero's hand)
+- File: `solver/solver-cli/` (Rust crate)
+
+## Phase 4: Bidirectional ZeroMQ -- HALF DONE
+- Mac -> PC: game state (done, PUB/SUB in network.py)
+- PC -> Mac: solver strategy (not done)
+- Switch to REQ/REP pattern for request-response flow
+
+## Phase 5: PC-Side Orchestrator -- NOT STARTED
+- Receives GameState, runs range lookup + action reconstruction
+- Calls solver-cli, returns strategy to Mac
+- File: `solver/solver_bridge.py`
+
+## Phase 6: Mac Display -- NOT STARTED
+- Show solver recommendation (action frequencies, EV)
+- Terminal overlay or simple GUI
+
+## Phase 7: Multi-Table -- NOT STARTED
+- Parallel pipeline instances per window
+- Per-table ZeroMQ topics or separate ports
 
 ## File Structure
 ```
 poker/
-  src/
-    capture.py       - Window capture (macOS Quartz API)
-    regions.py       - Table region coordinates (ratio-based)
-    ocr.py           - Tesseract OCR (deprecated, kept as fallback)
-    vision_ocr.py    - macOS Vision OCR (primary)
-    digit_ocr.py     - Template-based digit matching (for problematic reads)
-    card_id.py       - Card identification (rank + suit from board/hero cards)
-    game_state.py    - Game state model
-    pipeline.py      - Main OCR pipeline
-    network.py       - ZeroMQ network layer (Mac -> PC)
-    live.py          - Live window capture loop (in progress)
+  src/                       # Mac-side OCR (complete)
+    capture.py               - Window capture (macOS Quartz API)
+    regions.py               - Table region coordinates (ratio-based)
+    ocr.py                   - Tesseract OCR (deprecated fallback)
+    vision_ocr.py            - macOS Vision OCR (primary)
+    digit_ocr.py             - Template-based digit matching (unused fallback)
+    card_id.py               - Card identification (rank + suit)
+    game_state.py            - Game state model + serialization
+    pipeline.py              - Main OCR pipeline
+    network.py               - ZeroMQ network layer (Mac -> PC)
+    live.py                  - Live window capture loop
+  solver/                    # PC-side solver (TODO)
+    ranges.json              - Preflop range lookup table
+    action_history.py        - Action sequence reconstruction
+    solver_bridge.py         - Orchestrator (receive -> solve -> respond)
+    solver-cli/              - Rust CLI wrapping postflop-solver
   templates/
-    card_ranks/      - Card rank templates for template matching
+    card_ranks/              - Card rank templates (all 13 ranks)
+  tests/
   reference_screenshots/
-  calibrate.py       - Visual region calibration tool
+  calibrate.py               - Visual region calibration tool
   requirements.txt
 ```
