@@ -25,6 +25,15 @@ env/
 # Debug crops (generated during calibration)
 debug_crops/
 
+# Debug/development screenshots (keep only numbered reference screenshots)
+reference_screenshots/dbg_*
+reference_screenshots/debug_*
+reference_screenshots/grid_*
+reference_screenshots/meas_*
+reference_screenshots/strip_*
+reference_screenshots/crop_*
+reference_screenshots/desktop_*
+
 # Temp files
 /tmp/
 *.tmp

@@ -20,7 +20,7 @@ from src.card_id import (
     identify_card,
     _load_templates,
 )
-from src.regions import BOARD_CARDS, HERO_CARDS
+from src.regions import BOARD_CARDS, HERO_CARDS, extract_table_area
 
 REF_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "reference_screenshots")
 
@@ -44,8 +44,10 @@ class TestTemplateLoading:
         assert isinstance(templates, dict)
         # We should have at least the 5 templates: 2, 3, 7, 9, J
         assert len(templates) >= 5
-        for rank, img in templates.items():
-            assert img.shape[0] == 40, f"Template {rank} height != 40"
+        for rank, imgs in templates.items():
+            assert isinstance(imgs, list), f"Template {rank} should be a list"
+            for img in imgs:
+                assert img.shape[0] == 40, f"Template {rank} height != 40"
 
     def test_template_ranks_valid(self):
         templates = _load_templates()
@@ -89,17 +91,17 @@ class TestExtractChar:
 # ---------------------------------------------------------------------------
 class TestDetectSuit:
     def _make_card_with_color(self, is_red):
-        """Make a synthetic card image with colored suit symbol."""
+        """Make a synthetic card image with colored suit symbol in top-right."""
         card = np.ones((120, 80, 3), dtype=np.uint8) * 240  # white card
         # Add dark border
         card[:5, :] = 50
         card[:, :3] = 50
-        # Suit area: top-right quadrant
-        sy, sx = 5, 45
+        # Suit pip in top-right corner (matching _detect_suit ROI: 55-95% width, 3-22% height)
+        sy, sx = 8, 48
         if is_red:
-            card[sy:sy + 25, sx:sx + 25] = [30, 30, 200]  # red in BGR
+            card[sy:sy + 18, sx:sx + 25] = [30, 30, 200]  # red in BGR
         else:
-            card[sy:sy + 25, sx:sx + 25] = [30, 30, 30]  # black
+            card[sy:sy + 18, sx:sx + 25] = [30, 30, 30]  # black
         return card
 
     def test_red_card_returns_heart_or_diamond(self):
@@ -231,3 +233,81 @@ class TestIdentifyCard:
         noise = np.random.randint(0, 256, (100, 70, 3), dtype=np.uint8)
         result = identify_card(noise)
         # Should either return None or a low-confidence guess — shouldn't crash
+
+
+# ---------------------------------------------------------------------------
+# Precise board card detection (slot-based, visually verified ground truth)
+# ---------------------------------------------------------------------------
+class TestBoardCardValues:
+    """Test exact card values using slot-based detection with full image."""
+
+    @staticmethod
+    def _detect_board(name):
+        img = _ref(name)
+        img = extract_table_area(img)
+        board_crop = BOARD_CARDS.crop(img)
+        return detect_and_identify_board(board_crop, full_img=img)
+
+    def test_flop_03(self):
+        assert self._detect_board("03_flop_hero_check.png") == ['2h', '9c', '3s']
+
+    def test_flop_04(self):
+        assert self._detect_board("04_flop_facing_bet.png") == ['2h', '9c', '3s']
+
+    def test_flop_05(self):
+        assert self._detect_board("05_flop_5s9s7h_hero_turn.png") == ['5s', '9c', '7h']
+
+    def test_flop_07(self):
+        assert self._detect_board("07_flop_2s9sQh_hero_check.png") == ['2s', '9c', 'Qh']
+
+    def test_turn_08(self):
+        assert self._detect_board("08_turn_2s9sQhQd_hero_bet.png") == ['2s', '9c', 'Qh', 'Qd']
+
+    def test_turn_10(self):
+        assert self._detect_board("10_turn_Kh3hAs2h_hero_bet.png") == ['Kh', '3c', 'Ad', '2h']
+
+    def test_turn_13_dollar(self):
+        assert self._detect_board("13_turn_Ks8h6s9c_dollar.png") == ['Kc', '8h', '6h', '9s']
+
+    def test_turn_15_dollar(self):
+        assert self._detect_board("15_turn_9s4c7c6s_dollar.png") == ['9s', '4d', '7s', '6c']
+
+    def test_preflop_01_no_cards(self):
+        assert self._detect_board("01_preflop_tiled.png") == []
+
+
+# ---------------------------------------------------------------------------
+# Precise hero card detection (visually verified ground truth)
+# ---------------------------------------------------------------------------
+class TestHeroCardValues:
+    """Test exact hero card values across all screenshots."""
+
+    @staticmethod
+    def _detect_hero(name):
+        img = _ref(name)
+        img = extract_table_area(img)
+        return detect_and_identify_hero(HERO_CARDS.crop(img))
+
+    def test_hero_02(self):
+        assert self._detect_hero("02_preflop_hero_turn.png") == ['7d', 'Js']
+
+    def test_hero_05(self):
+        assert self._detect_hero("05_flop_5s9s7h_hero_turn.png") == ['Td', '6s']
+
+    def test_hero_06(self):
+        assert self._detect_hero("06_preflop_hero_turn.png") == ['8s', '9h']
+
+    def test_hero_07(self):
+        assert self._detect_hero("07_flop_2s9sQh_hero_check.png") == ['8s', '9h']
+
+    def test_hero_09(self):
+        assert self._detect_hero("09_preflop_TsJc.png") == ['Tc', 'Js']
+
+    def test_hero_11_dollar(self):
+        assert self._detect_hero("11_preflop_4hTs_dollar.png") == ['4h', 'Ts']
+
+    def test_hero_13_dollar(self):
+        assert self._detect_hero("13_turn_Ks8h6s9c_dollar.png") == ['4h', 'Ts']
+
+    def test_hero_15_folded(self):
+        assert self._detect_hero("15_turn_9s4c7c6s_dollar.png") == []

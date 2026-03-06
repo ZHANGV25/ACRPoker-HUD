@@ -85,6 +85,17 @@ def parse_bb_amount(text: str) -> Optional[float]:
     # Remove 'BB' suffix
     text = re.sub(r'\s*BB\s*$', '', text, flags=re.IGNORECASE).strip()
 
+    # Normalize comma as decimal separator
+    text = text.replace(',', '.')
+
+    # Handle leading zero with missing decimal: "05" -> "0.5", "075" -> "0.75"
+    match = re.match(r'^0(\d+)$', text)
+    if match:
+        try:
+            return float("0." + match.group(1))
+        except ValueError:
+            pass
+
     # Try direct float parse
     try:
         return float(text)

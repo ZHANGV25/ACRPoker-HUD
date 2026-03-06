@@ -17,7 +17,11 @@ _templates = None
 
 
 def _load_templates() -> dict:
-    """Load card rank templates from disk."""
+    """Load card rank templates from disk.
+
+    Supports multiple templates per rank: '2.png', '2_v2.png', etc. all
+    map to rank '2'.  Returns dict mapping rank -> list of images.
+    """
     global _templates
     if _templates is not None:
         return _templates
@@ -27,11 +31,39 @@ def _load_templates() -> dict:
     for f in os.listdir(RANK_TEMPLATE_DIR):
         if not f.endswith(".png"):
             continue
-        rank = f.replace(".png", "")
+        # Extract rank: 'Q.png' -> 'Q', 'Q_v2.png' -> 'Q'
+        base = f.replace(".png", "")
+        rank = base.split("_")[0]
         img = cv2.imread(os.path.join(RANK_TEMPLATE_DIR, f), cv2.IMREAD_GRAYSCALE)
         if img is not None:
-            _templates[rank] = img
+            if rank not in _templates:
+                _templates[rank] = []
+            _templates[rank].append(img)
     return _templates
+
+
+def _iou_score(char_bin: np.ndarray, tmpl_bin: np.ndarray,
+               target_h: int = 40, margin: int = 4) -> float:
+    """Compute best IoU between a character and a template with alignment shifts."""
+    char_w = char_bin.shape[1]
+    tmpl_w = tmpl_bin.shape[1]
+
+    canvas_w = max(char_w, tmpl_w) + margin * 2
+    char_canvas = np.zeros((target_h, canvas_w), dtype=np.float32)
+    tmpl_canvas = np.zeros((target_h, canvas_w), dtype=np.float32)
+    co = (canvas_w - char_w) // 2
+    to = (canvas_w - tmpl_w) // 2
+    char_canvas[:, co:co + char_w] = char_bin
+    tmpl_canvas[:, to:to + tmpl_w] = tmpl_bin
+
+    best_iou = 0.0
+    for shift in range(-margin, margin + 1):
+        shifted = np.roll(char_canvas, shift, axis=1)
+        intersection = np.sum(shifted * tmpl_canvas)
+        union = np.sum(np.clip(shifted + tmpl_canvas, 0, 1))
+        iou = intersection / union if union > 0 else 0
+        best_iou = max(best_iou, iou)
+    return best_iou
 
 
 def _match_rank(char_img: np.ndarray) -> Tuple[str, float]:
@@ -47,27 +79,35 @@ def _match_rank(char_img: np.ndarray) -> Tuple[str, float]:
     if not templates:
         return '?', 0.0
 
-    target_h = 40
     best_rank = '?'
     best_score = -1.0
 
-    for rank, tmpl in templates.items():
-        max_w = max(char_img.shape[1], tmpl.shape[1])
-        pad1 = np.zeros((target_h, max_w), dtype=np.uint8)
-        pad2 = np.zeros((target_h, max_w), dtype=np.uint8)
-        o1 = (max_w - char_img.shape[1]) // 2
-        o2 = (max_w - tmpl.shape[1]) // 2
-        pad1[:, o1:o1 + char_img.shape[1]] = char_img
-        pad2[:, o2:o2 + tmpl.shape[1]] = tmpl
+    char_bin = (char_img > 127).astype(np.float32)
 
-        if pad1.std() == 0 or pad2.std() == 0:
-            continue
-        score = cv2.matchTemplate(pad1, pad2, cv2.TM_CCOEFF_NORMED).max()
-        if score > best_score:
-            best_score = score
-            best_rank = rank
+    for rank, tmpl_list in templates.items():
+        for tmpl in tmpl_list:
+            tmpl_bin = (tmpl > 127).astype(np.float32)
+            iou = _iou_score(char_bin, tmpl_bin)
+            if iou > best_score:
+                best_score = iou
+                best_rank = rank
 
     return best_rank, best_score
+
+
+def _match_rank_single(char_img: np.ndarray, rank: str) -> float:
+    """Get the best IoU score for a specific rank (across all its templates)."""
+    templates = _load_templates()
+    if rank not in templates:
+        return 0.0
+
+    char_bin = (char_img > 127).astype(np.float32)
+    best_iou = 0.0
+    for tmpl in templates[rank]:
+        tmpl_bin = (tmpl > 127).astype(np.float32)
+        iou = _iou_score(char_bin, tmpl_bin)
+        best_iou = max(best_iou, iou)
+    return best_iou
 
 
 def _extract_char_from_roi(roi: np.ndarray) -> Optional[np.ndarray]:
@@ -88,6 +128,12 @@ def _extract_char_from_roi(roi: np.ndarray) -> Optional[np.ndarray]:
     # Non-white pixels: dark (low value) OR highly colored (high saturation)
     text_mask = ((v < 160) | (s > 60)).astype(np.uint8) * 255
 
+    # A valid card rank ROI should have a white card face background.
+    # Reject if there aren't enough bright pixels (i.e. no card face visible).
+    bright_pct = np.sum(v > 180) / v.size
+    if bright_pct < 0.15:
+        return None
+
     contours, _ = cv2.findContours(text_mask, cv2.RETR_EXTERNAL,
                                    cv2.CHAIN_APPROX_SIMPLE)
     if not contours:
@@ -107,22 +153,38 @@ def _extract_char_from_roi(roi: np.ndarray) -> Optional[np.ndarray]:
     return cv2.resize(char_img, (new_w, target_h), interpolation=cv2.INTER_NEAREST)
 
 
-def _find_face_start(card_img: np.ndarray) -> Tuple[int, int]:
+def _find_face_start(card_img: np.ndarray, search_right: bool = False) -> Tuple[int, int]:
     """Find where the white card face starts (x, y offset).
+
+    Args:
+        card_img: BGR image of a card.
+        search_right: If True, search for the face in the right portion of the
+            image (useful for overlapping hero card 2).
 
     Returns (face_x, face_y).
     """
     gray = cv2.cvtColor(card_img, cv2.COLOR_BGR2GRAY)
     ch, cw = gray.shape
 
-    # Sample row at 15% height
-    sample_row = min(max(int(ch * 0.15), 1), ch - 1)
-    white_cols = np.where(gray[sample_row, :] > 200)[0]
-    face_x = int(white_cols[0]) if len(white_cols) > 0 else 0
+    if search_right:
+        # For overlapping card 2: sample from the right 2/3 of the image
+        sample_col = min(max(int(cw * 0.70), 0), cw - 1)
+        white_rows = np.where(gray[:, sample_col] > 200)[0]
+        face_y = int(white_rows[0]) if len(white_rows) > 0 else 0
 
-    center_col = min(max(cw // 2, 0), cw - 1)
-    white_rows = np.where(gray[:, center_col] > 200)[0]
-    face_y = int(white_rows[0]) if len(white_rows) > 0 else 0
+        sample_row = min(max(face_y + int(ch * 0.15), 1), ch - 1)
+        # Find where card 2's face starts (skip card 1 bleed on left)
+        right_half = gray[sample_row, cw // 2:]
+        white_cols = np.where(right_half > 200)[0]
+        face_x = (cw // 2 + int(white_cols[0])) if len(white_cols) > 0 else cw // 2
+    else:
+        sample_row = min(max(int(ch * 0.15), 1), ch - 1)
+        white_cols = np.where(gray[sample_row, :] > 200)[0]
+        face_x = int(white_cols[0]) if len(white_cols) > 0 else 0
+
+        center_col = min(max(cw // 2, 0), cw - 1)
+        white_rows = np.where(gray[:, center_col] > 200)[0]
+        face_y = int(white_rows[0]) if len(white_rows) > 0 else 0
 
     return face_x, face_y
 
@@ -139,10 +201,11 @@ def _read_rank(card_img: np.ndarray) -> Optional[str]:
     ch, cw = card_img.shape[:2]
     face_x, face_y = _find_face_start(card_img)
 
-    # Rank area: top-left of the card face
-    rx1 = face_x + 2
+    # Rank area: top-left of the card face (allow small margin before face_x
+    # to avoid clipping characters that start at the very edge)
+    rx1 = max(face_x - 3, 0)
     ry1 = face_y + 2
-    rx2 = min(rx1 + max(int(cw * 0.35), 45), cw)
+    rx2 = min(rx1 + max(int(cw * 0.40), 50), cw)
     ry2 = min(ry1 + max(int(ch * 0.30), 42), ch)
 
     rank_roi = card_img[ry1:ry2, rx1:rx2]
@@ -157,27 +220,164 @@ def _read_rank(card_img: np.ndarray) -> Optional[str]:
     if score < 0.5:
         return None
 
+    # Check for "10" (T): the "0" digit may match as 9/6/8/Q.
+    # Only check for ranks whose shape resembles "0".
+    if rank in ('9', '6', 'Q', 'T') and score < 0.90:
+        if _has_one_digit_left(rank_roi, char_norm):
+            return 'T'
+
     # Disambiguate 6/9 if needed
     if rank in ('6', '9') and score < 0.95:
-        rank = _disambiguate_6_9(rank_roi)
+        other = '6' if rank == '9' else '9'
+        other_score = _match_rank_single(char_norm, other)
+        if score - other_score > 0.05:
+            pass  # Template clearly favors this rank
+        else:
+            rank = _disambiguate_6_9(char_norm)
 
     return rank
 
 
-def _disambiguate_6_9(rank_roi: np.ndarray) -> str:
-    """Distinguish 6 from 9 by ink distribution (9 has bulk at top)."""
-    gray = cv2.cvtColor(rank_roi, cv2.COLOR_BGR2GRAY)
-    _, mask = cv2.threshold(gray, 180, 255, cv2.THRESH_BINARY_INV)
+def _has_one_digit_left(rank_roi: np.ndarray, char_norm: np.ndarray) -> bool:
+    """Check if there's a narrow '1' digit to the left of the extracted char.
 
-    rh = mask.shape[0]
-    top_ink = cv2.countNonZero(mask[:rh // 2, :])
-    bottom_ink = cv2.countNonZero(mask[rh // 2:, :])
+    ACR displays 10 as two characters. If _extract_char_from_roi picked up
+    only the '0', this detects the '1' next to it, confirming the rank is T.
+    """
+    hsv = cv2.cvtColor(rank_roi, cv2.COLOR_BGR2HSV)
+    s = hsv[:, :, 1].astype(int)
+    v = hsv[:, :, 2].astype(int)
+    text_mask = ((v < 160) | (s > 60)).astype(np.uint8) * 255
+
+    contours, _ = cv2.findContours(text_mask, cv2.RETR_EXTERNAL,
+                                   cv2.CHAIN_APPROX_SIMPLE)
+    if len(contours) < 2:
+        return False
+
+    # Find the largest contour (the '0') and any tall narrow contour to its left
+    largest = max(contours, key=cv2.contourArea)
+    lx, ly, lw, lh = cv2.boundingRect(largest)
+
+    for c in contours:
+        if c is largest:
+            continue
+        cx, cy, cw, ch_c = cv2.boundingRect(c)
+        if ch_c < lh * 0.5:
+            continue
+        # Must be to the left of the largest contour
+        if cx + cw > lx:
+            continue
+        # Must be narrow (like a '1')
+        if cw >= ch_c * 0.6:
+            continue
+        # Must have sufficient fill ratio (real '1' > 0.28, border < 0.22)
+        area = cv2.contourArea(c)
+        if area / (cw * ch_c) < 0.28:
+            continue
+        # Must be close to the '0' (gap < 50% of '0' width)
+        gap = lx - (cx + cw)
+        if gap > lw * 0.5:
+            continue
+        # The '0' should be round-ish (width > 40% of height)
+        if lw < lh * 0.4:
+            continue
+        return True
+
+    return False
+
+
+def _disambiguate_6_9(char_img: np.ndarray) -> str:
+    """Distinguish 6 from 9 by ink distribution on the extracted character.
+
+    A '9' has its closed loop (bulk) at the top; a '6' at the bottom.
+
+    Args:
+        char_img: Binary image (white on black), 40px height.
+    """
+    rh = char_img.shape[0]
+    top_ink = cv2.countNonZero(char_img[:rh // 2, :])
+    bottom_ink = cv2.countNonZero(char_img[rh // 2:, :])
 
     return '9' if top_ink > bottom_ink else '6'
 
 
+def _suit_from_rank_color(rank_roi: np.ndarray,
+                          four_color: bool = False) -> Optional[str]:
+    """Detect suit from the color of the rank text (4-color deck).
+
+    In a 4-color deck the rank text is colored per suit:
+    green=clubs, blue=diamonds, red=hearts, black=spades.
+
+    Green and blue are always returned (unique to 4-color decks).
+    Red ('h') and black ('s') are only returned when four_color=True,
+    since in 2-color decks red=hearts/diamonds and black=clubs/spades.
+    """
+    hsv = cv2.cvtColor(rank_roi, cv2.COLOR_BGR2HSV)
+    h, s, v = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
+
+    text_px = (s > 30) | (v < 170)
+    total = int(np.sum(text_px))
+    if total < 10:
+        return None
+
+    green = int(np.sum((h >= 35) & (h <= 85) & (s > 50) & (v > 50) & text_px))
+    blue = int(np.sum((h >= 100) & (h <= 135) & (s > 50) & (v > 50) & text_px))
+    red1 = int(np.sum((h <= 10) & (s > 50) & (v > 50) & text_px))
+    red2 = int(np.sum((h >= 170) & (s > 50) & (v > 50) & text_px))
+    red = red1 + red2
+    black = int(np.sum((v < 120) & (s < 80) & text_px))
+
+    threshold = max(total * 0.15, 5)
+    if green > threshold and green > blue and green > black:
+        return 'c'
+    if blue > threshold and blue > green and blue > black:
+        return 'd'
+    if four_color:
+        if red > threshold and red > black:
+            return 'h'
+        if black > threshold:
+            return 's'
+    return None
+
+
+def _check_4color_pip(roi: np.ndarray) -> Optional[str]:
+    """Check for 4-color deck suit colors (green=clubs, blue=diamonds).
+
+    In a 4-color deck, clubs are green and diamonds are blue — colors that
+    never appear in a standard 2-color deck.  If either is detected, the
+    suit is unambiguous.  For red (hearts) and black (spades), returns None
+    so the caller can fall back to existing logic (which works for both
+    2-color and 4-color decks since hearts are always red and spades always
+    black).
+    """
+    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    h, s, v = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
+
+    # Only look at non-white pixels (the colored pip, not card background)
+    non_white = (s > 30) | (v < 170)
+    total = int(np.sum(non_white))
+    if total < 5:
+        return None
+
+    green = int(np.sum((h >= 35) & (h <= 85) & (s > 50) & (v > 50) & non_white))
+    blue = int(np.sum((h >= 100) & (h <= 135) & (s > 50) & (v > 50) & non_white))
+    black = int(np.sum((v < 120) & (s < 80) & non_white))
+
+    threshold = max(total * 0.15, 5)
+    # Green/blue must exceed both threshold AND black count to avoid
+    # false positives from dark spade/club pixels with slight color cast.
+    if green > threshold and green > blue and green > black:
+        return 'c'
+    if blue > threshold and blue > green and blue > black:
+        return 'd'
+
+    return None
+
+
 def _detect_suit(card_img: np.ndarray) -> str:
-    """Detect the suit of a card using color and shape analysis.
+    """Detect the suit of a card using the top-right corner pip.
+
+    ACR card layout: rank in top-left, suit pip in top-right.
 
     Returns: 'h', 'd', 'c', or 's'.
     """
@@ -187,17 +387,22 @@ def _detect_suit(card_img: np.ndarray) -> str:
     face_w = cw - face_x
     face_h = ch - face_y
 
-    # Suit symbol: top-right area of card face
-    sx1 = face_x + max(int(face_w * 0.50), 1)
+    # Top-right suit pip: ~55-95% of face width, 3-22% of face height
+    sx1 = face_x + max(int(face_w * 0.55), 1)
     sx2 = min(face_x + int(face_w * 0.95), cw)
-    sy1 = face_y + 2
-    sy2 = min(face_y + max(int(face_h * 0.30), 10), ch)
+    sy1 = face_y + max(int(face_h * 0.03), 1)
+    sy2 = min(face_y + int(face_h * 0.22), ch)
 
     suit_roi = card_img[sy1:sy2, sx1:sx2]
     if suit_roi.size == 0:
         return 's'
 
-    # Color detection
+    # 4-color deck: green=clubs, blue=diamonds — check first
+    fc = _check_4color_pip(suit_roi)
+    if fc is not None:
+        return fc
+
+    # Color detection (2-color fallback)
     hsv = cv2.cvtColor(suit_roi, cv2.COLOR_BGR2HSV)
     red1 = cv2.inRange(hsv, np.array([0, 80, 80]), np.array([10, 255, 255]))
     red2 = cv2.inRange(hsv, np.array([170, 80, 80]), np.array([180, 255, 255]))
@@ -208,38 +413,44 @@ def _detect_suit(card_img: np.ndarray) -> str:
 
     is_red = red_px > dark_px and red_px > suit_roi.shape[0] * suit_roi.shape[1] * 0.03
 
-    # Shape analysis for specific suit
+    # Shape analysis on the pip contour
     gray = cv2.cvtColor(suit_roi, cv2.COLOR_BGR2GRAY)
     _, suit_mask = cv2.threshold(gray, 180, 255, cv2.THRESH_BINARY_INV)
-    sh, sw = suit_mask.shape
 
-    if sh < 5 or sw < 5:
+    # Find the largest contour (the pip symbol)
+    contours, _ = cv2.findContours(suit_mask, cv2.RETR_EXTERNAL,
+                                    cv2.CHAIN_APPROX_SIMPLE)
+    valid = [c for c in contours if cv2.contourArea(c) > 15]
+    if not valid:
         return 'h' if is_red else 's'
 
-    # Width profile: compare width at top vs middle
+    pip_c = max(valid, key=cv2.contourArea)
+    bx, by, bw, bh = cv2.boundingRect(pip_c)
+    pip_mask = suit_mask[by:by + bh, bx:bx + bw]
+    ph, pw = pip_mask.shape
+
+    if ph < 5 or pw < 5:
+        return 'h' if is_red else 's'
+
     def _width_at(pct):
-        row = min(int(sh * pct), sh - 1)
-        nz = np.where(suit_mask[row, :] > 0)[0]
+        row = min(int(ph * pct), ph - 1)
+        nz = np.where(pip_mask[row, :] > 0)[0]
         return int(nz[-1] - nz[0]) if len(nz) >= 2 else 0
 
-    w_top = _width_at(0.15)
-    w_mid = _width_at(0.50)
-
-    if w_mid == 0:
-        return 'h' if is_red else 's'
-
-    ratio = w_top / w_mid
-
     if is_red:
-        # Hearts: wide at top (two humps), ratio > 0.6
-        # Diamonds: narrow at top (point), ratio < 0.6
-        return 'h' if ratio > 0.6 else 'd'
+        # Hearts: two humps at top → wide at 10%, wide at 50%
+        # Diamonds: point at top → narrow at 10%, wide at 50%
+        w_top = _width_at(0.10)
+        w_mid = _width_at(0.50)
+        if w_mid == 0:
+            return 'h' if w_top > 0 else 'd'
+        return 'h' if w_top / w_mid > 0.5 else 'd'
     else:
-        # Clubs have 3 separate lobes that appear as separate pixel groups
-        # at ~35-45% height. Spades have a smooth continuous outline.
-        for pct in [0.35, 0.40, 0.45]:
-            row = min(int(sh * pct), sh - 1)
-            nz = np.where(suit_mask[row, :] > 0)[0]
+        # Clubs vs spades: two approaches for robustness
+        # 1. Multiple pixel groups at 50-65% height (3+ groups = clubs)
+        for pct in [0.50, 0.55, 0.60, 0.65]:
+            row = min(int(ph * pct), ph - 1)
+            nz = np.where(pip_mask[row, :] > 0)[0]
             if len(nz) >= 2:
                 groups = 1
                 for j in range(1, len(nz)):
@@ -247,6 +458,217 @@ def _detect_suit(card_img: np.ndarray) -> str:
                         groups += 1
                 if groups >= 3:
                     return 'c'
+
+        # 2. Waist-to-lower width ratio: clubs have a narrow waist (25-45%)
+        #    then dramatic widening (50-65%) due to three lobes + stem.
+        #    Spades widen monotonically. Ratio >1.8 = clubs.
+        waist_widths = []
+        lower_widths = []
+        for pct in [0.25, 0.30, 0.35, 0.40, 0.45]:
+            row = min(int(ph * pct), ph - 1)
+            nz = np.where(pip_mask[row, :] > 0)[0]
+            if len(nz) >= 2:
+                waist_widths.append(int(nz[-1] - nz[0]))
+        for pct in [0.50, 0.55, 0.60, 0.65]:
+            row = min(int(ph * pct), ph - 1)
+            nz = np.where(pip_mask[row, :] > 0)[0]
+            if len(nz) >= 2:
+                lower_widths.append(int(nz[-1] - nz[0]))
+        if waist_widths and lower_widths:
+            min_waist = min(waist_widths)
+            max_lower = max(lower_widths)
+            if min_waist > 0 and max_lower / min_waist > 1.8:
+                return 'c'
+
+        return 's'
+
+
+def _detect_suit_hero(card_img: np.ndarray) -> str:
+    """Detect suit of hero card 1 (front card, top-right pip may be cut off).
+
+    Uses rank text color for red/black, then the below-rank pip area for
+    specific suit (clubs have multiple lobes = multiple contours).
+    """
+    ch, cw = card_img.shape[:2]
+    face_x, face_y = _find_face_start(card_img)
+    face_w = cw - face_x
+    face_h = ch - face_y
+
+    # Red vs black from rank text color
+    ry2 = face_y + max(int(face_h * 0.30), 5)
+    rx2 = face_x + max(int(face_w * 0.45), 5)
+    rank_area = card_img[face_y:ry2, face_x:rx2]
+    hsv_r = cv2.cvtColor(rank_area, cv2.COLOR_BGR2HSV)
+    r1 = cv2.inRange(hsv_r, np.array([0, 80, 80]), np.array([10, 255, 255]))
+    r2 = cv2.inRange(hsv_r, np.array([170, 80, 80]), np.array([180, 255, 255]))
+    rank_red = int(cv2.countNonZero(r1) + cv2.countNonZero(r2))
+    dark_mask = cv2.inRange(hsv_r, np.array([0, 0, 0]), np.array([180, 80, 150]))
+    rank_dark = int(cv2.countNonZero(dark_mask))
+    is_red = rank_red > rank_dark * 0.3 and rank_red > 10
+
+    # Below-rank pip area: 25-45% of face height, left 35% of face width
+    py1 = face_y + max(int(face_h * 0.25), 3)
+    py2 = face_y + min(int(face_h * 0.45), ch)
+    px1 = face_x
+    px2 = face_x + max(int(face_w * 0.35), 5)
+    pip = card_img[py1:py2, px1:px2]
+    if pip.size == 0:
+        return 'h' if is_red else 's'
+
+    # 4-color deck: green=clubs, blue=diamonds
+    fc = _check_4color_pip(pip)
+    if fc is not None:
+        return fc
+
+    hsv = cv2.cvtColor(pip, cv2.COLOR_BGR2HSV)
+
+    if is_red:
+        # Red suits: check pip shape for hearts vs diamonds
+        m1 = cv2.inRange(hsv, np.array([0, 50, 80]), np.array([10, 255, 255]))
+        m2 = cv2.inRange(hsv, np.array([170, 50, 80]), np.array([180, 255, 255]))
+        suit_mask = cv2.bitwise_or(m1, m2)
+        contours, _ = cv2.findContours(suit_mask, cv2.RETR_EXTERNAL,
+                                        cv2.CHAIN_APPROX_SIMPLE)
+        valid = [c for c in contours if cv2.contourArea(c) > 10]
+        if not valid:
+            return 'h'
+        pip_c = max(valid, key=cv2.contourArea)
+        bx, by, bw, bh = cv2.boundingRect(pip_c)
+        # Diamonds are taller than wide (aspect < 1), hearts are wider
+        if bh > 0 and bw / bh < 0.9:
+            return 'd'
+        return 'h'
+    else:
+        # Black suits: clubs have multiple lobes (2+ separate contours)
+        dark_m = cv2.inRange(hsv, np.array([0, 0, 0]), np.array([180, 120, 120]))
+        contours, _ = cv2.findContours(dark_m, cv2.RETR_EXTERNAL,
+                                        cv2.CHAIN_APPROX_SIMPLE)
+        valid = [c for c in contours if cv2.contourArea(c) > 10]
+        if len(valid) >= 2:
+            return 'c'
+        return 's'
+
+
+def _detect_suit_hero_best(card_img: np.ndarray) -> str:
+    """Best-effort suit detection for hero card 1.
+
+    Tries the top-right pip method first (_detect_suit). If the pip area
+    has enough content, uses that result. Otherwise falls back to
+    _detect_suit_hero (rank text color + below-rank pip).
+    """
+    ch, cw = card_img.shape[:2]
+    face_x, face_y = _find_face_start(card_img)
+    face_w = cw - face_x
+    face_h = ch - face_y
+
+    # Check if top-right pip area has enough dark/colored content
+    sx1 = face_x + max(int(face_w * 0.55), 1)
+    sx2 = min(face_x + int(face_w * 0.95), cw)
+    sy1 = face_y + max(int(face_h * 0.03), 1)
+    sy2 = min(face_y + int(face_h * 0.22), ch)
+
+    if sx2 > sx1 + 3 and sy2 > sy1 + 3:
+        suit_roi = card_img[sy1:sy2, sx1:sx2]
+        gray = cv2.cvtColor(suit_roi, cv2.COLOR_BGR2GRAY)
+        _, mask = cv2.threshold(gray, 180, 255, cv2.THRESH_BINARY_INV)
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL,
+                                       cv2.CHAIN_APPROX_SIMPLE)
+        valid = [c for c in contours if cv2.contourArea(c) > 15]
+        if valid:
+            pip_c = max(valid, key=cv2.contourArea)
+            pip_area = cv2.contourArea(pip_c)
+            roi_area = suit_roi.shape[0] * suit_roi.shape[1]
+            # If pip occupies >5% of ROI, the pip is sufficiently visible
+            if pip_area > roi_area * 0.05:
+                return _detect_suit(card_img)
+
+    return _detect_suit_hero(card_img)
+
+
+def _detect_suit_pip(card_img: np.ndarray, search_right: bool = False) -> str:
+    """Detect suit from the small corner pip below the rank character.
+
+    Used for hero cards where the center suit symbol is occluded by overlap.
+    """
+    ch, cw = card_img.shape[:2]
+    face_x, face_y = _find_face_start(card_img, search_right=search_right)
+    face_w = cw - face_x
+    face_h = ch - face_y
+
+    # Pip is below the rank: ~28-48% of face height, left 40% of face width
+    py1 = face_y + max(int(face_h * 0.28), 5)
+    py2 = face_y + min(int(face_h * 0.50), ch)
+    px1 = face_x + 2
+    px2 = face_x + max(int(face_w * 0.42), 10)
+
+    pip = card_img[py1:py2, px1:px2]
+    if pip.size == 0:
+        return 's'
+
+    # 4-color deck: green=clubs, blue=diamonds
+    fc = _check_4color_pip(pip)
+    if fc is not None:
+        return fc
+
+    # Color detection (2-color fallback)
+    hsv = cv2.cvtColor(pip, cv2.COLOR_BGR2HSV)
+    red1 = cv2.inRange(hsv, np.array([0, 80, 80]), np.array([10, 255, 255]))
+    red2 = cv2.inRange(hsv, np.array([170, 80, 80]), np.array([180, 255, 255]))
+    red_px = int(cv2.countNonZero(red1) + cv2.countNonZero(red2))
+    dark = cv2.inRange(hsv, np.array([0, 0, 0]), np.array([180, 120, 120]))
+    dark_px = int(cv2.countNonZero(dark))
+    total = pip.shape[0] * pip.shape[1]
+
+    is_red = red_px > dark_px and red_px > total * 0.03
+
+    # Shape analysis on the pip
+    gray = cv2.cvtColor(pip, cv2.COLOR_BGR2GRAY)
+    _, mask = cv2.threshold(gray, 180, 255, cv2.THRESH_BINARY_INV)
+    sh, sw = mask.shape
+
+    if sh < 4 or sw < 4:
+        return 'h' if is_red else 's'
+
+    def _width_at(pct):
+        row = min(int(sh * pct), sh - 1)
+        nz = np.where(mask[row, :] > 0)[0]
+        return int(nz[-1] - nz[0]) if len(nz) >= 2 else 0
+
+    if is_red:
+        w_top = _width_at(0.15)
+        w_mid = _width_at(0.50)
+        if w_mid == 0:
+            return 'h'
+        return 'h' if w_top / w_mid > 0.6 else 'd'
+    else:
+        # Clubs vs spades: use waist-to-lower width ratio
+        # (more reliable than pixel groups for small pips)
+        contours_p, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL,
+                                         cv2.CHAIN_APPROX_SIMPLE)
+        valid_p = [c for c in contours_p if cv2.contourArea(c) > 3]
+        if valid_p:
+            pip_c = max(valid_p, key=cv2.contourArea)
+            bx, by, bw, bh = cv2.boundingRect(pip_c)
+            pip_mask = mask[by:by + bh, bx:bx + bw]
+            ph, pw = pip_mask.shape
+            if ph >= 6 and pw >= 4:
+                waist_widths = []
+                lower_widths = []
+                for pct in [0.25, 0.30, 0.35, 0.40, 0.45]:
+                    row = min(int(ph * pct), ph - 1)
+                    nz = np.where(pip_mask[row, :] > 0)[0]
+                    if len(nz) >= 2:
+                        waist_widths.append(int(nz[-1] - nz[0]))
+                for pct in [0.50, 0.55, 0.60, 0.65]:
+                    row = min(int(ph * pct), ph - 1)
+                    nz = np.where(pip_mask[row, :] > 0)[0]
+                    if len(nz) >= 2:
+                        lower_widths.append(int(nz[-1] - nz[0]))
+                if waist_widths and lower_widths:
+                    min_waist = min(waist_widths)
+                    max_lower = max(lower_widths)
+                    if min_waist > 0 and max_lower / min_waist > 1.8:
+                        return 'c'
         return 's'
 
 
@@ -262,20 +684,73 @@ def identify_card(card_img: np.ndarray) -> Optional[str]:
     rank = _read_rank(card_img)
     if rank is None:
         return None
-    suit = _detect_suit(card_img)
+    # Try rank text color first (4-color deck), fall back to pip shape
+    ch, cw = card_img.shape[:2]
+    face_x, face_y = _find_face_start(card_img)
+    face_w, face_h = cw - face_x, ch - face_y
+    rank_area = card_img[face_y:face_y + max(int(face_h * 0.30), 5),
+                         face_x:face_x + max(int(face_w * 0.50), 5)]
+    suit = _suit_from_rank_color(rank_area)
+    if suit is None:
+        suit = _detect_suit(card_img)
+    return rank + suit
+
+
+def _identify_card_right(card_img: np.ndarray,
+                         four_color: bool = False) -> Optional[str]:
+    """Identify a card where the face is in the right portion (overlapping card 2)."""
+    face_x, face_y = _find_face_start(card_img, search_right=True)
+    ch, cw = card_img.shape[:2]
+
+    rx1 = max(face_x - 3, 0)
+    ry1 = face_y + 2
+    rx2 = min(rx1 + max(int(cw * 0.40), 50), cw)
+    ry2 = min(ry1 + max(int(ch * 0.30), 42), ch)
+
+    rank_roi = card_img[ry1:ry2, rx1:rx2]
+    if rank_roi.size == 0:
+        return None
+
+    char_norm = _extract_char_from_roi(rank_roi)
+    if char_norm is None:
+        return None
+
+    rank, score = _match_rank(char_norm)
+    if score < 0.65:
+        return None
+
+    # Check for "10" (T)
+    if rank in ('9', '6', 'Q', 'T') and score < 0.90:
+        if _has_one_digit_left(rank_roi, char_norm):
+            rank = 'T'
+
+    # Try rank text color for suit (most reliable for 4-color deck)
+    suit = _suit_from_rank_color(rank_roi, four_color=four_color)
+    if suit is None:
+        suit = _detect_suit_pip(card_img, search_right=True)
     return rank + suit
 
 
 def _find_merged_card_area(region_img: np.ndarray,
-                           min_area: int = 1000) -> Optional[Tuple[int, int, int, int]]:
+                           min_area: int = 1000,
+                           strict: bool = False) -> Optional[Tuple[int, int, int, int]]:
     """Find the bounding box of the merged white card area.
+
+    Args:
+        strict: Use a smaller morphological kernel (for hero cards where
+                the default kernel merges non-card UI elements).
 
     Returns (x, y, w, h) or None.
     """
     hsv = cv2.cvtColor(region_img, cv2.COLOR_BGR2HSV)
     white_mask = cv2.inRange(hsv, np.array([0, 0, 170]), np.array([180, 55, 255]))
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 5))
-    closed = cv2.morphologyEx(white_mask, cv2.MORPH_CLOSE, kernel, iterations=3)
+
+    if strict:
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 3))
+        closed = cv2.morphologyEx(white_mask, cv2.MORPH_CLOSE, kernel, iterations=1)
+    else:
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 5))
+        closed = cv2.morphologyEx(white_mask, cv2.MORPH_CLOSE, kernel, iterations=3)
 
     contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not contours:
@@ -288,39 +763,123 @@ def _find_merged_card_area(region_img: np.ndarray,
     return cv2.boundingRect(largest)
 
 
-def detect_and_identify_board(board_img: np.ndarray) -> List[Optional[str]]:
+def detect_and_identify_board(board_img: np.ndarray,
+                               full_img: Optional[np.ndarray] = None) -> List[Optional[str]]:
     """Detect and identify community cards on the board.
+
+    When full_img is provided, uses calibrated BOARD_CARD_SLOTS for precise
+    per-card cropping (avoids turn/river splitting errors). Falls back to
+    merged-area splitting from board_img if full_img is not given.
 
     Args:
         board_img: BGR image of the board area (BOARD_CARDS region crop).
+            Used for card-presence detection and as fallback.
+        full_img: Full table image (after extract_table_area). When provided,
+            individual card slots are cropped from this image.
 
     Returns:
         List of card strings. Empty if no cards detected.
     """
+    if full_img is not None:
+        return _detect_board_from_slots(full_img)
+
+    # Fallback: merged-area approach (for backward compat / tests)
     rect = _find_merged_card_area(board_img, min_area=5000)
     if rect is None:
         return []
 
     x, y, w, h = rect
-
-    # Estimate number of cards from aspect ratio
-    # Single card aspect ~0.65-0.85. Merged cards: width / (height * single_aspect)
-    single_card_aspect = 0.75
+    single_card_aspect = 0.68
     expected_card_w = h * single_card_aspect
     num_cards = max(1, round(w / expected_card_w))
-    num_cards = min(num_cards, 5)  # Max 5 community cards
+    num_cards = min(num_cards, 5)
 
     card_width = w // num_cards
     cards = []
-
     for i in range(num_cards):
         cx1 = x + i * card_width
         cx2 = x + (i + 1) * card_width
         card_img = board_img[y:y + h, cx1:cx2]
         card_str = identify_card(card_img)
         cards.append(card_str)
+    return cards
+
+
+def _detect_board_from_slots(full_img: np.ndarray) -> List[Optional[str]]:
+    """Detect board cards using calibrated per-card slot regions."""
+    from src.regions import BOARD_CARD_SLOTS
+
+    WHITE_MIN_PCT = 0.10
+    ih, iw = full_img.shape[:2]
+    cards = []
+
+    for slot in BOARD_CARD_SLOTS:
+        x1, y1, x2, y2 = slot.to_pixels(iw, ih)
+        card_crop = full_img[y1:y2, x1:x2]
+
+        # Check if a card is present (white card face)
+        hsv = cv2.cvtColor(card_crop, cv2.COLOR_BGR2HSV)
+        white_pct = np.sum(
+            (hsv[:, :, 1] < 55) & (hsv[:, :, 2] > 170)
+        ) / (card_crop.shape[0] * card_crop.shape[1])
+
+        if white_pct < WHITE_MIN_PCT:
+            continue
+
+        result = identify_card(card_crop)
+        if result is not None:
+            cards.append(result)
 
     return cards
+
+
+def _find_hero_cards_no_close(hero_img: np.ndarray) -> Optional[Tuple[int, int, int, int]]:
+    """Find hero card area without morphological closing.
+
+    Used when the default closing merges non-card UI elements.
+    Finds the two largest white contours that overlap in y-position (the cards).
+    """
+    hsv = cv2.cvtColor(hero_img, cv2.COLOR_BGR2HSV)
+    white_mask = cv2.inRange(hsv, np.array([0, 0, 200]), np.array([180, 30, 255]))
+    contours, _ = cv2.findContours(white_mask, cv2.RETR_EXTERNAL,
+                                    cv2.CHAIN_APPROX_SIMPLE)
+    # Filter to contours that could be cards (area > 500, reasonable aspect)
+    card_contours = []
+    for c in contours:
+        area = cv2.contourArea(c)
+        if area < 500:
+            continue
+        bx, by, bw, bh = cv2.boundingRect(c)
+        # Cards are roughly taller than wide
+        if bh > bw * 0.5:
+            card_contours.append((bx, by, bw, bh, area))
+
+    if len(card_contours) < 2:
+        # Fallback: just use the two largest contours
+        all_valid = [(cv2.boundingRect(c), cv2.contourArea(c))
+                     for c in contours if cv2.contourArea(c) > 500]
+        all_valid.sort(key=lambda x: x[1], reverse=True)
+        if len(all_valid) >= 2:
+            (x1, y1, w1, h1), _ = all_valid[0]
+            (x2, y2, w2, h2), _ = all_valid[1]
+            min_x = min(x1, x2)
+            min_y = min(y1, y2)
+            max_x = max(x1 + w1, x2 + w2)
+            max_y = max(y1 + h1, y2 + h2)
+            return min_x, min_y, max_x - min_x, max_y - min_y
+        return None
+
+    # Sort by area descending, take top 2
+    card_contours.sort(key=lambda c: c[4], reverse=True)
+    cards = card_contours[:2]
+
+    # Merge bounding boxes
+    min_x = min(c[0] for c in cards)
+    min_y = min(c[1] for c in cards)
+    max_x = max(c[0] + c[2] for c in cards)
+    max_y = max(c[1] + c[3] for c in cards)
+
+    return min_x, min_y, max_x - min_x, max_y - min_y
 
 
 def detect_and_identify_hero(hero_img: np.ndarray) -> List[Optional[str]]:
@@ -332,11 +891,20 @@ def detect_and_identify_hero(hero_img: np.ndarray) -> List[Optional[str]]:
     Returns:
         List of 0-2 card strings.
     """
+    rh, rw = hero_img.shape[:2]
     rect = _find_merged_card_area(hero_img, min_area=500)
     if rect is None:
         return []
 
     x, y, w, h = rect
+
+    # If default kernel merged non-card UI elements (area >70% of crop),
+    # find the two card contours without morphological closing
+    if w * h > rw * rh * 0.70:
+        rect = _find_hero_cards_no_close(hero_img)
+        if rect is None:
+            return []
+        x, y, w, h = rect
 
     # Hero cards: 2 cards, slightly overlapping
     # Split at ~48% for cleaner separation (card 1 is in front)
@@ -348,21 +916,51 @@ def detect_and_identify_hero(hero_img: np.ndarray) -> List[Optional[str]]:
 
     # Two cards
     split = int(w * 0.48)
+
+    # Helper: get rank area for a card crop
+    def _rank_area(card_crop):
+        ch_c, cw_c = card_crop.shape[:2]
+        fx, fy = _find_face_start(card_crop)
+        fw, fh = cw_c - fx, ch_c - fy
+        return card_crop[fy:fy + max(int(fh * 0.30), 5),
+                         fx:fx + max(int(fw * 0.50), 5)]
+
+    c1 = hero_img[y:y + h, x:x + split]
+    c2 = hero_img[y:y + h, x + split:x + w]
+
+    # Detect 4-color mode: if either card's rank text is green or blue,
+    # then red=hearts and black=spades unambiguously.
+    c1_rank_roi = _rank_area(c1)
+    c1_color = _suit_from_rank_color(c1_rank_roi)
+
+    # Also check card 2 for green/blue (card 1 might be red/black)
+    face_x2, face_y2 = _find_face_start(c2, search_right=True)
+    ch2, cw2 = c2.shape[:2]
+    fw2, fh2 = cw2 - face_x2, ch2 - face_y2
+    c2_rank_roi = c2[face_y2:face_y2 + max(int(fh2 * 0.30), 5),
+                     face_x2:face_x2 + max(int(fw2 * 0.50), 5)]
+    c2_color = _suit_from_rank_color(c2_rank_roi)
+    is_4color = (c1_color in ('c', 'd')) or (c2_color in ('c', 'd'))
+
     cards = []
 
-    # Card 1: left portion
-    c1 = hero_img[y:y + h, x:x + split]
-    cards.append(identify_card(c1))
+    # Card 1: left portion (front card — top-right pip may be cut off)
+    c1_rank = _read_rank(c1)
+    if c1_rank is not None:
+        c1_suit = c1_color  # Already computed above
+        if c1_suit is None:
+            c1_suit = _suit_from_rank_color(c1_rank_roi, four_color=is_4color)
+        if c1_suit is None:
+            c1_suit = _detect_suit_hero_best(c1)
+        cards.append(c1_rank + c1_suit)
+    else:
+        cards.append(None)
 
-    # Card 2: right portion — rank is in its own top-left corner
-    # The card 2 starts where card 1 ends, but its white face
-    # extends from about the split point to x+w
-    c2 = hero_img[y:y + h, x + split:x + w]
-    # For card 2, the rank character may be further right due to overlap
-    # Try to identify normally first
-    c2_result = identify_card(c2)
+    # Card 2: right portion — overlapped by card 1 on the left
+    # Try with search_right=True since card 1 bleeds into the left of c2
+    c2_result = _identify_card_right(c2, four_color=is_4color)
     if c2_result is None:
-        # Try extracting rank from the visible top portion with adjusted ROI
+        # Skip normal identify_card — it picks up card 1's content on the left
         c2_result = _identify_hero_card2(hero_img, x, y, w, h, split)
     cards.append(c2_result)
 
@@ -510,19 +1108,21 @@ def _identify_hero_card2(hero_img: np.ndarray, x: int, y: int,
     if not contours:
         return None
 
-    # Find contours that look like rank characters: taller than wide, reasonable size
+    # Find contours that look like rank characters: taller than wide, reasonable size.
+    # Skip contours touching the left edge (card 1 bleed-through).
     rank_candidates = []
     for c in contours:
         cx, cy, cw, ch_c = cv2.boundingRect(c)
         area = cv2.contourArea(c)
-        if ch_c > 10 and cw < ch_c * 1.5 and area > 20:
+        if ch_c > 10 and cw < ch_c * 1.5 and area > 20 and cx > 2:
             rank_candidates.append((cx, cy, cw, ch_c, area))
 
     if not rank_candidates:
         return None
 
-    # Pick the tallest character that's not too far right (should be near left of card 2)
-    rank_candidates.sort(key=lambda r: r[3], reverse=True)
+    # Try all candidates and pick the one with the best match score
+    best_result = None
+    best_score = 0.0
 
     for cx, cy, cw, ch_c, area in rank_candidates:
         char_img = mask[cy:cy + ch_c, cx:cx + cw]
@@ -533,10 +1133,13 @@ def _identify_hero_card2(hero_img: np.ndarray, x: int, y: int,
                                interpolation=cv2.INTER_NEAREST)
 
         rank, score = _match_rank(char_norm)
-        if score > 0.5:
-            # Detect suit from card 2 area
-            c2_full = hero_img[y:y + h, x + split:x + w]
-            suit = _detect_suit(c2_full)
-            return rank + suit
+        if score > best_score and score > 0.5:
+            best_score = score
+            best_result = rank
+
+    if best_result is not None:
+        c2_full = hero_img[y:y + h, x + split:x + w]
+        suit = _detect_suit_pip(c2_full, search_right=True)
+        return best_result + suit
 
     return None

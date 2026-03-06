@@ -8,6 +8,7 @@ from src.regions import (
     BOARD_CARDS,
     FOLD_BUTTON, CALL_CHECK_BUTTON, RAISE_BET_BUTTON,
     HAND_STRENGTH, HERO_CARDS, TITLE_BAR, HAND_ID,
+    extract_table_area,
 )
 from src.vision_ocr import (
     read_bb_amount, read_pot, read_action_label,
@@ -25,6 +26,9 @@ def process_screenshot(img: np.ndarray) -> GameState:
     """
     state = GameState()
 
+    # Auto-crop to game window if screenshot has black padding
+    img = extract_table_area(img)
+
     # Title bar info
     title_text = ocr_crop(TITLE_BAR.crop(img))
     state.stakes = title_text
@@ -40,7 +44,7 @@ def process_screenshot(img: np.ndarray) -> GameState:
 
     # Board cards
     board_crop = BOARD_CARDS.crop(img)
-    state.board = detect_and_identify_board(board_crop)
+    state.board = detect_and_identify_board(board_crop, full_img=img)
     state.infer_street()
 
     # Hero cards
@@ -65,6 +69,10 @@ def process_screenshot(img: np.ndarray) -> GameState:
         # Action label
         action = read_action_label(regions["action"].crop(img))
         player.action_label = action
+
+        # Current bet
+        bet = read_bb_amount(regions["bet"].crop(img))
+        player.current_bet_bb = bet
 
         # Check if folded
         if action and "F" in action.split("/")[-1]:
