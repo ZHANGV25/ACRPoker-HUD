@@ -348,5 +348,11 @@ class StatsDB:
                 count += 1
         return count
 
+    def all_player_names(self):
+        # type: () -> set
+        """Return set of all player names ever recorded."""
+        cur = self._conn.execute("SELECT DISTINCT player FROM player_actions")
+        return {row[0] for row in cur.fetchall()}
+
     def close(self):
         self._conn.close()

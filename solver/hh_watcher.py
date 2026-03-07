@@ -51,7 +51,9 @@ class HHWatcher:
         if self._running:
             return
         self._running = True
-        # Initial bulk import of all existing files
+        # Load all known names from DB (covers previous sessions)
+        self._known_names.update(self._db.all_player_names())
+        # Import any new hands from HH files
         self._initial_import()
         self._thread = threading.Thread(target=self._watch_loop, daemon=True)
         self._thread.start()
