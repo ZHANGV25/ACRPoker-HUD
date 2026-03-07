@@ -44,3 +44,6 @@ reference_screenshots/desktop_*
 # Coverage
 htmlcov/
 .coverage
+
+# Player stats database (generated at runtime)
+solver/player_stats.db

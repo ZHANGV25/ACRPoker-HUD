@@ -7,7 +7,9 @@ Real-time poker HUD for ACR Poker on macOS. Captures the poker table via screen 
 - **Live OCR**: Reads board cards, hero cards, player stacks, bets, pot size, dealer button, and action labels from the ACR Poker window
 - **Preflop Ranges**: Looks up GTO open/call/3-bet/4-bet ranges by position (6-max cash)
 - **Postflop Solver**: Runs a local Rust solver (wrapping [postflop-solver](https://github.com/b-inary/postflop-solver)) for turn and river spots
-- **Overlay UI**: Compact always-on-top window showing strategy advice, powered by native macOS AppKit
+- **Player Stats (HUD)**: Parses ACR hand history files for VPIP, PFR, 3bet%, archetype classification (fish, nit, TAG, LAG, etc.)
+- **Exploitative Adjustments**: Widens/narrows assumed opponent ranges based on their archetype, adds exploit tips to preflop advice
+- **Overlay UI**: Compact always-on-top window showing strategy advice + player stats, powered by native macOS AppKit
 - **Multi-table**: Tracks multiple expanded table windows independently
 
 ## Requirements
@@ -123,11 +125,15 @@ poker/
     ranges.json                - Preflop GTO range tables (6-max cash)
     range_lookup.py            - Range lookup by position + scenario
     action_history.py          - Preflop action reconstruction + HandTracker
+    hh_parser.py               - ACR hand history file parser
+    player_stats.py            - SQLite player stat tracker + archetype classification
+    hh_watcher.py              - Background file watcher for hand histories
+    exploitative.py            - Exploitative range adjustments by opponent type
     solver-cli/                - Rust CLI wrapping postflop-solver
       src/main.rs              - Solver binary (JSON in -> JSON out)
   templates/
     card_ranks/                - Card rank templates for template matching (13 ranks)
-  tests/                       - Test suite (card ID, pipeline, ranges, etc.)
+  tests/                       - Test suite (151 tests)
   reference_screenshots/       - Test screenshots
 ```
 
@@ -149,6 +155,19 @@ poker/
 - ~35 GTO ranges for 6-max cash: RFI, vs-RFI (call/3bet), vs-3bet (call/4bet)
 - Position-aware: adjusts advice based on opener position and hero position
 - Cross-validates OCR reads to avoid phantom raise detection
+
+### Player Stats (HUD)
+- Parses ACR hand history files from `~/Downloads/AmericasCardroom/handHistory/`
+- Background file watcher detects new hands as they're appended after each hand
+- Per-player stats stored in local SQLite: VPIP, PFR, 3bet%, Fold-to-Cbet%, WTSD%, AF
+- Archetype classification: fish, calling station, nit, TAG, LAG, whale, maniac
+- Stats displayed next to player names in the overlay (VPIP/PFR + archetype)
+
+### Exploitative Adjustments
+- Automatically adjusts opponent's assumed range based on archetype
+- Fish/whale: solver assumes wider range (1.5-2x), enabling thinner value bets
+- Nit: solver assumes tighter range (0.5x), enabling wider steals
+- Preflop advice includes exploit tips (e.g. "[station: value only, no bluffs]")
 
 ### Postflop Solver
 - Rust binary wrapping the postflop-solver library

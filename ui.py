@@ -25,6 +25,8 @@ from src.pipeline import process_screenshot
 from src.watch import ReadingSmoother, EngineRunner, ENGINE_BIN, MIN_WINDOW_WIDTH
 from solver.range_lookup import RangeLookup, preflop_advice
 from solver.action_history import HandTracker
+from solver.hh_watcher import HHWatcher
+from solver.exploitative import adjust_advice, adjust_solver_ranges
 
 POLL_INTERVAL = 1.0  # seconds
 
@@ -54,11 +56,12 @@ def _capture_settled():
     return img2, title
 
 
-def _build_display(img, tracker, smoother, engine, rl, name_cache):
+def _build_display(img, tracker, smoother, engine, rl, name_cache, hh_watcher=None):
     """Process frame and return formatted text string.
 
     name_cache: dict of seat -> locked name, persists across frames.
     Resets when hand_id changes.
+    hh_watcher: HHWatcher instance for player stats (optional).
     """
     t0 = time.time()
     gs = process_screenshot(img)
@@ -107,6 +110,16 @@ def _build_display(img, tracker, smoother, engine, rl, name_cache):
     if solver_inputs and gs.hero_cards and len(gs.hero_cards) == 2:
         hero_pos = solver_inputs.get("hero_position", "")
         if hero_pos and all(gs.hero_cards) and hero_has_action:
+            # Exploitative: adjust villain range based on archetype
+            if hh_watcher:
+                for p in gs.players:
+                    if p.is_sitting_out or p.is_folded or p.is_hero:
+                        continue
+                    if p.name:
+                        vs = hh_watcher.get_player_stats(p.name)
+                        solver_inputs = adjust_solver_ranges(solver_inputs, vs)
+                        break  # adjust for primary villain only
+
             # Only solve turn/river — flop is too slow for live play
             if board_len >= 4:
                 bet_sizes = tracker.get_bet_sizes()
@@ -154,8 +167,26 @@ def _build_display(img, tracker, smoother, engine, rl, name_cache):
         advice = None
         if hero_pos_name and gs.hero_cards:
             advice = preflop_advice(gs.hero_cards, hero_pos_name, gs, rl)
+
+        # Exploitative adjustment: find the main villain (opener or 3bettor)
+        if advice and hh_watcher:
+            villain_name = None
+            for p in gs.players:
+                if p.is_sitting_out or p.is_folded or p.is_hero:
+                    continue
+                bet = p.current_bet_bb or 0
+                pos = positions.get(p.seat, "")
+                if pos not in ("SB", "BB") and bet > 1.0:
+                    villain_name = p.name
+                    break
+                if pos == "BB" and bet > 1.0:
+                    villain_name = p.name
+                    break
+            if villain_name:
+                vs = hh_watcher.get_player_stats(villain_name)
+                advice = adjust_advice(advice, vs)
+
         if advice:
-            # Parse action word from advice (e.g. "RAISE  AKs in CO's open range")
             lines.append("\u2550" * 38)
             lines.append("  \u25b6  {}".format(advice))
             lines.append("\u2550" * 38)
@@ -214,8 +245,17 @@ def _build_display(img, tracker, smoother, engine, rl, name_cache):
         if p.is_folded:
             action = "FOLD"
         hero_mark = " \u25c0" if p.is_hero else ""
-        lines.append("{:<4} {:<10} {:>6} {:>5} {}{}".format(
-            pos, name, stack, bet, action, hero_mark))
+
+        # Player stats from hand history
+        stat_str = ""
+        if hh_watcher and p.name and not p.is_hero:
+            ps = hh_watcher.get_player_stats(p.name)
+            if ps.hands >= 5:
+                stat_str = " {:.0f}/{:.0f} {}".format(
+                    ps.vpip, ps.pfr, ps.archetype)
+
+        lines.append("{:<4} {:<10} {:>6} {:>5} {}{}{}".format(
+            pos, name, stack, bet, action, hero_mark, stat_str))
 
     # ── Debug (compact, at bottom) ──
     lines.append("")
@@ -229,6 +269,8 @@ def _build_display(img, tracker, smoother, engine, rl, name_cache):
     if status == "done" and engine.last_solve_time:
         parts[-1] = "done({:.1f}s)".format(engine.last_solve_time)
     parts.append("hand:{}".format((gs.hand_id or "?")[-6:]))
+    if hh_watcher:
+        parts.append("hh:{}".format(hh_watcher.total_hands))
     if solver_err:
         parts.append(solver_err[:40])
     lines.append(" ".join(parts))
@@ -274,6 +316,8 @@ class OverlayDelegate(AppKit.NSObject):
         self.smoother = ReadingSmoother()
         self.engine = EngineRunner()
         self.rl = RangeLookup()
+        self.hh_watcher = HHWatcher()
+        self.hh_watcher.start()
         self.last_text = ""
 
         # Start background capture thread
@@ -298,7 +342,7 @@ class OverlayDelegate(AppKit.NSObject):
                 if img is None:
                     text = "Waiting for table...\n{}".format(title) if title else "Waiting for table..."
                 else:
-                    text = _build_display(img, self.tracker, self.smoother, self.engine, self.rl, name_cache)
+                    text = _build_display(img, self.tracker, self.smoother, self.engine, self.rl, name_cache, self.hh_watcher)
 
                 with self._queue_lock:
                     self._text_queue.append(text)

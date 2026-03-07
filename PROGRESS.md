@@ -89,56 +89,24 @@ game_state.py -----> watch.py (live loop + smoothing)
 - Expanded action word filtering for OCR garble
 - Preflop advice cross-validates call amounts against actual player bets
 
-## TODO
+## Phase 7: Hand History Parser + Player Stats -- COMPLETE
+Parse ACR hand history files for accurate player stat tracking.
 
-### Phase 7: Hand History Parser + Player Stats
-Parse ACR hand history files for accurate player stat tracking. Much more reliable than OCR for building player profiles.
+- **File watcher** (`solver/hh_watcher.py`) — tails HH directory, detects new hands as appended
+- **Parser** (`solver/hh_parser.py`) — extracts all structured data: players, actions, amounts, boards, showdowns
+- **Stat tracker** (`solver/player_stats.py`) — SQLite DB with per-player stats:
+  - VPIP, PFR, 3bet%, Fold-to-Cbet%, WTSD%, AF
+- **Archetype classification** — fish, calling_station, nit, TAG, LAG, whale, maniac
+- **Overlay integration** — stats shown next to player names (VPIP/PFR archetype)
+- HH location: `~/Downloads/AmericasCardroom/handHistory/vortexted/`
+- 498 hands parsed from existing files, 61 players tracked
 
-**Hand history location:**
-```
-~/Downloads/AmericasCardroom/handHistory/vortexted/
-```
-- One file per table session, e.g. `HH20260307 CASHID-G34634290T254 TN-Ideal GAMETYPE-Hold'em ...`
-- Plain text, appended after each hand completes (not during)
-- Contains: exact player names, seats, stacks, all actions with dollar amounts, hole cards (hero only), board, pot, rake
-
-**Format example:**
-```
-Hand #2686716500 - Holdem (No Limit) - $0.01/$0.02 - 2026/03/07 06:44:11 UTC
-Ideal 6-max Seat #6 is the button
-Seat 1: 6o6linKin6 ($3.91)
-Seat 2: EZcomeEZgo18 ($1.68)
-...
-*** HOLE CARDS ***
-Dealt to vortexted [3h 2d]
-Heebert raises $0.05 to $0.05
-SVSPNYK calls $0.05
-vortexted folds
-...
-*** SUMMARY ***
-```
-
-**Plan:**
-1. **File watcher** — tail hand history files, detect new hands as they're appended
-2. **Parser** — extract structured data: players, actions, amounts, showdowns
-3. **Stat tracker** — per-player stats stored in local SQLite DB:
-   - VPIP (voluntarily put $ in pot) — loose vs tight
-   - PFR (preflop raise %) — passive vs aggressive
-   - 3bet % — how often they 3bet
-   - Fold to Cbet % — can we bluff them?
-   - WTSD (went to showdown %) — calling station detection
-   - AF (aggression factor) — bet+raise / call ratio
-4. **Display in overlay** — show key stats next to player names
-5. **Archetype classification** — bucket players: fish, calling station, nit, LAG, TAG
-   - Simple thresholds (e.g. VPIP>40 + PFR<10 = calling station)
-
-**Hybrid approach:** OCR for live in-hand info (cards, board, pot, action buttons). Hand history for player stats (updated after each hand completes).
-
-### Phase 8: Exploitative Adjustments
-- Adjust solver input ranges based on opponent archetype
-- e.g. vs calling station: widen value range, remove bluffs
-- e.g. vs nit: narrow their range, bluff more
-- Could use LLM for nuanced multi-street pattern interpretation (Phase 8b)
+## Phase 8: Exploitative Adjustments -- COMPLETE
+- `solver/exploitative.py` adjusts solver inputs based on opponent archetype
+- **Range expansion/contraction**: fish/whale assumed wider range, nit assumed tighter
+- **Preflop advice tips**: e.g. "CALL AQo vs UTG open [nit: wider steal]"
+- **Solver range adjustment**: villain's range auto-widened/narrowed before solving
+- Full 169-combo hand strength ordering for range manipulation
 
 ## Known Issues
 - Dollar mode tables: stacks/pot read as garbage (only BB mode works)
@@ -162,6 +130,10 @@ poker/
     ranges.json                  - Preflop range lookup table
     range_lookup.py              - Range lookup by position + scenario
     action_history.py            - Action reconstruction + HandTracker
+    hh_parser.py                 - Hand history file parser
+    player_stats.py              - SQLite stat tracker + archetype classification
+    hh_watcher.py                - Live file watcher for hand histories
+    exploitative.py              - Exploitative range adjustments
     solver-cli/                  - Rust CLI wrapping postflop-solver
   templates/
     card_ranks/                  - Card rank templates (all 13 ranks)
