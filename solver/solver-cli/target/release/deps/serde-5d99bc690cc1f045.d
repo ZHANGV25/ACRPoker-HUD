@@ -1,0 +1,14 @@
+/Users/victor/Documents/Dev/poker/solver/solver-cli/target/release/deps/serde-5d99bc690cc1f045.d: /Users/victor/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/lib.rs /Users/victor/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/integer128.rs /Users/victor/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/mod.rs /Users/victor/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/de.rs /Users/victor/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/ser.rs /Users/victor/Documents/Dev/poker/solver/solver-cli/target/release/build/serde-52ba48f4c6d16176/out/private.rs
+
+/Users/victor/Documents/Dev/poker/solver/solver-cli/target/release/deps/libserde-5d99bc690cc1f045.rlib: /Users/victor/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/lib.rs /Users/victor/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/integer128.rs /Users/victor/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/mod.rs /Users/victor/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/de.rs /Users/victor/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/ser.rs /Users/victor/Documents/Dev/poker/solver/solver-cli/target/release/build/serde-52ba48f4c6d16176/out/private.rs
+
+/Users/victor/Documents/Dev/poker/solver/solver-cli/target/release/deps/libserde-5d99bc690cc1f045.rmeta: /Users/victor/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/lib.rs /Users/victor/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/integer128.rs /Users/victor/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/mod.rs /Users/victor/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/de.rs /Users/victor/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/ser.rs /Users/victor/Documents/Dev/poker/solver/solver-cli/target/release/build/serde-52ba48f4c6d16176/out/private.rs
+
+/Users/victor/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/lib.rs:
+/Users/victor/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/integer128.rs:
+/Users/victor/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/mod.rs:
+/Users/victor/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/de.rs:
+/Users/victor/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/ser.rs:
+/Users/victor/Documents/Dev/poker/solver/solver-cli/target/release/build/serde-52ba48f4c6d16176/out/private.rs:
+
+# env-dep:OUT_DIR=/Users/victor/Documents/Dev/poker/solver/solver-cli/target/release/build/serde-52ba48f4c6d16176/out
