@@ -40,9 +40,11 @@ This produces `solver/solver-cli/target/release/tbl-engine`.
 
 ### 4. ACR Poker settings
 
+- Use **multi-table mode** (required)
+  - Set **background (off-action) size** to the smallest option — this keeps inactive tables small
+  - Set **on-action size** to a larger size — the HUD only reads hero cards when the table expands for your turn, avoiding misreads from the small view
 - Use **BB display mode** (not dollar amounts)
 - Enable **4-color deck** for best card recognition
-- Keep the table window expanded (not minimized/tiled)
 
 ## Running
 
