@@ -89,6 +89,57 @@ game_state.py -----> watch.py (live loop + smoothing)
 - Expanded action word filtering for OCR garble
 - Preflop advice cross-validates call amounts against actual player bets
 
+## TODO
+
+### Phase 7: Hand History Parser + Player Stats
+Parse ACR hand history files for accurate player stat tracking. Much more reliable than OCR for building player profiles.
+
+**Hand history location:**
+```
+~/Downloads/AmericasCardroom/handHistory/vortexted/
+```
+- One file per table session, e.g. `HH20260307 CASHID-G34634290T254 TN-Ideal GAMETYPE-Hold'em ...`
+- Plain text, appended after each hand completes (not during)
+- Contains: exact player names, seats, stacks, all actions with dollar amounts, hole cards (hero only), board, pot, rake
+
+**Format example:**
+```
+Hand #2686716500 - Holdem (No Limit) - $0.01/$0.02 - 2026/03/07 06:44:11 UTC
+Ideal 6-max Seat #6 is the button
+Seat 1: 6o6linKin6 ($3.91)
+Seat 2: EZcomeEZgo18 ($1.68)
+...
+*** HOLE CARDS ***
+Dealt to vortexted [3h 2d]
+Heebert raises $0.05 to $0.05
+SVSPNYK calls $0.05
+vortexted folds
+...
+*** SUMMARY ***
+```
+
+**Plan:**
+1. **File watcher** — tail hand history files, detect new hands as they're appended
+2. **Parser** — extract structured data: players, actions, amounts, showdowns
+3. **Stat tracker** — per-player stats stored in local SQLite DB:
+   - VPIP (voluntarily put $ in pot) — loose vs tight
+   - PFR (preflop raise %) — passive vs aggressive
+   - 3bet % — how often they 3bet
+   - Fold to Cbet % — can we bluff them?
+   - WTSD (went to showdown %) — calling station detection
+   - AF (aggression factor) — bet+raise / call ratio
+4. **Display in overlay** — show key stats next to player names
+5. **Archetype classification** — bucket players: fish, calling station, nit, LAG, TAG
+   - Simple thresholds (e.g. VPIP>40 + PFR<10 = calling station)
+
+**Hybrid approach:** OCR for live in-hand info (cards, board, pot, action buttons). Hand history for player stats (updated after each hand completes).
+
+### Phase 8: Exploitative Adjustments
+- Adjust solver input ranges based on opponent archetype
+- e.g. vs calling station: widen value range, remove bluffs
+- e.g. vs nit: narrow their range, bluff more
+- Could use LLM for nuanced multi-street pattern interpretation (Phase 8b)
+
 ## Known Issues
 - Dollar mode tables: stacks/pot read as garbage (only BB mode works)
 - OCR occasionally misreads decimals (e.g. "0.5" -> "5.0")
