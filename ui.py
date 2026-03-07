@@ -81,15 +81,14 @@ def _build_display(img, tracker, smoother, engine, rl, name_cache, hh_watcher=No
 
     smoother.update(gs, hero_has_action=hero_has_action)
 
-    # Stabilize player names: lock first non-empty read per seat per hand
-    hand_id = gs.hand_id
-    if name_cache.get("_hand_id") != hand_id:
-        name_cache.clear()
-        name_cache["_hand_id"] = hand_id
+    # Stabilize player names: only update from confident reads (hero has action = big view)
+    # Names persist across hands — players rarely change seats mid-session
+    if hero_has_action:
+        for p in gs.players:
+            if p.name and len(p.name) >= 3:
+                name_cache[p.seat] = p.name
     for p in gs.players:
-        if p.name and p.seat not in name_cache:
-            name_cache[p.seat] = p.name
-        elif p.seat in name_cache:
+        if p.seat in name_cache:
             p.name = name_cache[p.seat]
 
     positions = gs.infer_positions()
