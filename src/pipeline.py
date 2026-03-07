@@ -17,6 +17,39 @@ from src.vision_ocr import (
 from src.card_id import detect_and_identify_board, detect_and_identify_hero, detect_dealer_button
 from src.game_state import GameState, PlayerState
 
+# Words that ACR overlays on top of or near player names (results, actions)
+_ACTION_WORDS = frozenset({
+    "FOLD", "CALL", "CHECK", "RAISE", "BET", "ALLIN", "ALL-IN",
+    "MUCK", "SHOW", "DON'T SHOW", "DONT SHOW", "DON'T", "DONT",
+    "POST SB", "POST BB", "POST", "POST B8",
+    "CHFCK", "CHEC", "RAISF", "RAIS",
+    "SITTING OUT", "SITTING", "SIT OUT", "DO GAILUC",
+})
+
+
+def _clean_name(raw):
+    # type: (str) -> str
+    """Filter out action/overlay words that OCR picks up in the name region."""
+    if not raw:
+        return ""
+    upper = raw.strip().upper()
+    # Exact match
+    if upper in _ACTION_WORDS:
+        return ""
+    # Starts with action word (e.g. "FOLD " or "CALL 2.5")
+    for word in _ACTION_WORDS:
+        if upper.startswith(word) and (len(upper) == len(word) or not upper[len(word)].isalpha()):
+            return ""
+    # Fuzzy: collapse spaces and recheck (OCR reads "FOLD" as "FOI D", "FOL D", etc.)
+    collapsed = upper.replace(" ", "")
+    for word in _ACTION_WORDS:
+        if collapsed == word.replace(" ", ""):
+            return ""
+    # Common OCR misreads of action words
+    if collapsed in ("FOID", "FOLD", "FOIS", "FOLO", "CALI", "CHFCK", "RAISF"):
+        return ""
+    return raw.strip()
+
 
 
 def process_screenshot(img: np.ndarray) -> GameState:
@@ -59,7 +92,7 @@ def process_screenshot(img: np.ndarray) -> GameState:
         player = PlayerState(seat=seat_num)
 
         # Name
-        name = ocr_crop(regions["name"].crop(img))
+        name = _clean_name(ocr_crop(regions["name"].crop(img)))
         player.name = name if name else None
 
         # Stack

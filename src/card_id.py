@@ -92,6 +92,26 @@ def _match_rank(char_img: np.ndarray) -> Tuple[str, float]:
                 best_score = iou
                 best_rank = rank
 
+    # J is the narrowest rank (15px). If best match is J but the extracted
+    # character is wide, it's likely a misread of 6, 9, or another wide rank.
+    if best_rank == 'J':
+        char_cols = (char_bin > 0.5).any(axis=0)
+        char_ink_w = int(char_cols.sum())
+        if char_ink_w > 17:
+            # Re-score against wide ranks only, pick best
+            second_rank = '?'
+            second_score = -1.0
+            for rank in ('6', '9', '5', '3', '2', '8'):
+                if rank in templates:
+                    for tmpl in templates[rank]:
+                        tmpl_bin = (tmpl > 127).astype(np.float32)
+                        iou = _iou_score(char_bin, tmpl_bin)
+                        if iou > second_score:
+                            second_score = iou
+                            second_rank = rank
+            if second_score > 0.2:
+                return second_rank, second_score
+
     return best_rank, best_score
 
 
@@ -828,7 +848,9 @@ def _detect_board_from_slots(full_img: np.ndarray) -> List[Optional[str]]:
 
         result = identify_card(card_crop)
         if result is not None:
-            cards.append(result)
+            # A card can only appear once on the board
+            if result not in cards:
+                cards.append(result)
 
     return cards
 
