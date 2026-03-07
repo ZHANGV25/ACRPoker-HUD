@@ -1,4 +1,4 @@
-"""Screen capture module for ACR Poker windows on macOS."""
+"""Screen capture module for target application windows on macOS."""
 
 from typing import Optional, List, Dict
 import subprocess
@@ -24,8 +24,8 @@ import cv2
 from PIL import Image
 
 
-def find_acr_windows() -> List[Dict]:
-    """Find all ACR Poker table windows.
+def find_target_windows() -> List[Dict]:
+    """Find all target application table windows.
 
     Returns list of dicts with keys: id, title, bounds (x, y, w, h)
     """
@@ -36,15 +36,15 @@ def find_acr_windows() -> List[Dict]:
         kCGWindowListOptionOnScreenOnly, kCGNullWindowID
     )
 
-    acr_windows = []
+    target_windows = []
     for window in window_list:
         owner = window.get("kCGWindowOwnerName", "")
         title = window.get("kCGWindowName", "")
 
-        # ACR Poker window identification
-        if "ACR" in owner or "Winning Poker" in owner or "Hold'em" in title:
+        # Target window identification — require Hold in title to skip lobby
+        if ("Hold" in title) and ("ACR" in owner or "Winning" in owner):
             bounds = window.get("kCGWindowBounds", {})
-            acr_windows.append({
+            target_windows.append({
                 "id": window.get("kCGWindowNumber"),
                 "title": title,
                 "owner": owner,
@@ -56,7 +56,7 @@ def find_acr_windows() -> List[Dict]:
                 },
             })
 
-    return acr_windows
+    return target_windows
 
 
 def capture_window(window_id: int) -> Optional[np.ndarray]:
@@ -100,7 +100,7 @@ def capture_from_file(filepath: str) -> np.ndarray:
 
 
 if __name__ == "__main__":
-    # Quick test: find ACR windows and capture the first one
+    # Quick test: find target windows and capture the first one
     import sys
 
     if len(sys.argv) > 1:
@@ -109,12 +109,12 @@ if __name__ == "__main__":
         print(f"Loaded image from file: {img.shape}")
         cv2.imwrite("test_capture.png", img)
     else:
-        windows = find_acr_windows()
+        windows = find_target_windows()
         if not windows:
-            print("No ACR windows found. Pass a screenshot path to test from file.")
+            print("No target windows found. Pass a screenshot path to test from file.")
             sys.exit(1)
 
-        print(f"Found {len(windows)} ACR window(s):")
+        print(f"Found {len(windows)} target window(s):")
         for w in windows:
             print(f"  [{w['id']}] {w['title']} ({w['bounds']['w']}x{w['bounds']['h']})")
 

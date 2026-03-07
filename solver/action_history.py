@@ -16,11 +16,56 @@ ACTION_MAP = {
 
 # Default bet sizing tree for solver (% of pot)
 DEFAULT_BET_SIZES = {
-    "oop_bet": ["33%", "67%", "150%"],
-    "oop_raise": ["60%", "100%", "allin"],
-    "ip_bet": ["33%", "67%", "150%"],
-    "ip_raise": ["60%", "100%", "allin"],
+    "oop_bet": "33%, 66%, a",
+    "oop_raise": "2.5x",
+    "ip_bet": "33%, 66%, a",
+    "ip_raise": "2.5x",
 }
+
+# Standard buckets for observed bet sizes
+_SIZE_BUCKETS = [25, 33, 50, 66, 75, 100, 150]
+
+
+def _snap_to_bucket(pct):
+    # type: (float) -> int
+    """Snap an observed bet-to-pot percentage to the nearest standard bucket."""
+    best = min(_SIZE_BUCKETS, key=lambda b: abs(b - pct))
+    return best
+
+
+def compute_bet_sizes(observed_bets, default=None):
+    # type: (List[float], Optional[Dict]) -> Dict[str, str]
+    """Convert observed bet-to-pot ratios into solver bet size strings.
+
+    Args:
+        observed_bets: list of bet/pot ratios as percentages (e.g. [33.0, 75.0])
+        default: fallback sizes dict
+
+    Returns:
+        Dict with keys bet_sizes_oop, bet_sizes_ip, raise_sizes_oop, raise_sizes_ip
+    """
+    if default is None:
+        default = DEFAULT_BET_SIZES
+
+    if not observed_bets:
+        return {
+            "bet_sizes_oop": default["oop_bet"],
+            "bet_sizes_ip": default["ip_bet"],
+            "raise_sizes_oop": default["oop_raise"],
+            "raise_sizes_ip": default["ip_raise"],
+        }
+
+    # Snap observed bets to standard buckets, deduplicate
+    buckets = sorted(set(_snap_to_bucket(b) for b in observed_bets))
+    # Always include all-in
+    bet_str = ", ".join("{}%".format(b) for b in buckets) + ", a"
+
+    return {
+        "bet_sizes_oop": bet_str,
+        "bet_sizes_ip": bet_str,
+        "raise_sizes_oop": default["oop_raise"],
+        "raise_sizes_ip": default["ip_raise"],
+    }
 
 
 def _normalize_action(label):
@@ -328,6 +373,22 @@ def determine_solver_inputs(game_state, range_lookup, hand_tracker=None):
     if game_state.hero_cards:
         hero_hand = "".join(game_state.hero_cards)
 
+    # Ensure hero's hand is in their range so the solver can find it.
+    # Combo must be higher-rank first (e.g. "9s2h" not "2h9s").
+    if hero_hand and len(hero_hand) == 4 and hero_position:
+        RANK_ORDER = "23456789TJQKA"
+        r1, s1, r2, s2 = hero_hand[0], hero_hand[1], hero_hand[2], hero_hand[3]
+        if RANK_ORDER.index(r1) >= RANK_ORDER.index(r2):
+            hero_combo = hero_hand  # already correct order
+        else:
+            hero_combo = r2 + s2 + r1 + s1  # swap to higher rank first
+        target_range = oop_range if hero_position == "oop" else ip_range
+        if hero_combo not in target_range:
+            if hero_position == "oop":
+                oop_range = oop_range + "," + hero_combo
+            else:
+                ip_range = ip_range + "," + hero_combo
+
     return {
         "board": game_state.board,
         "oop_range": oop_range,
@@ -403,6 +464,7 @@ class HandTracker:
     Use with live.py: call update() on each new GameState.
     The tracker remembers preflop actions even after the board appears.
     Locks dealer seat and solver matchup for the duration of a hand.
+    Tracks postflop actions and observed bet sizes.
     """
 
     def __init__(self):
@@ -412,6 +474,12 @@ class HandTracker:
         self._preflop_seen = False
         self._locked_dealer = None   # type: Optional[int]
         self._locked_solver = None   # type: Optional[Dict]
+        # Postflop tracking
+        self._last_street = "preflop"
+        self._prev_bets = {}  # type: Dict[int, Optional[float]]  # seat -> last bet
+        self._observed_bet_pcts = []  # type: List[float]  # bet-to-pot ratios
+        self.postflop_actions = {}  # type: Dict[str, List[Tuple[str, str, Optional[float]]]]
+        # street -> [(position, action, amount)]
 
     def update(self, game_state):
         # type: (...) -> None
@@ -444,6 +512,9 @@ class HandTracker:
             self.preflop_action = reconstruct_preflop(game_state, self._positions)
             self._preflop_seen = True
 
+        # Track postflop actions and bet sizes
+        self._track_postflop(game_state)
+
     def get_solver_inputs(self, game_state, range_lookup):
         # type: (...) -> Optional[Dict]
         """Get solver inputs using tracked state.
@@ -471,6 +542,121 @@ class HandTracker:
             result["hero_position"] = self._locked_solver["hero_position"]
         return result
 
+    def _track_postflop(self, game_state):
+        # type: (...) -> None
+        """Track postflop actions and observed bet sizes."""
+        street = game_state.street
+        if street == "preflop":
+            return
+
+        # Detect street change
+        if street != self._last_street:
+            self._prev_bets.clear()
+            self._last_street = street
+            if street not in self.postflop_actions:
+                self.postflop_actions[street] = []
+
+        # Check each player for new bets/actions
+        pot = game_state.total_bb or game_state.pot_bb or 0
+        for p in game_state.players:
+            if p.is_sitting_out or p.is_folded:
+                continue
+            prev_bet = self._prev_bets.get(p.seat)
+            curr_bet = p.current_bet_bb or 0
+
+            # Detect new bet/raise
+            if curr_bet > 0 and curr_bet != prev_bet:
+                pos = self._positions.get(p.seat, "?") if self._positions else "?"
+                action = _normalize_action(p.action_label) or "bet"
+
+                # Record action
+                if street not in self.postflop_actions:
+                    self.postflop_actions[street] = []
+                self.postflop_actions[street].append((pos, action, curr_bet))
+
+                # Record observed bet-to-pot ratio
+                if pot > 0:
+                    pct = (curr_bet / pot) * 100
+                    if 5 < pct < 300:  # sane range
+                        self._observed_bet_pcts.append(pct)
+
+            self._prev_bets[p.seat] = curr_bet if curr_bet > 0 else prev_bet
+
+    def get_bet_sizes(self):
+        # type: () -> Dict[str, str]
+        """Return solver bet size strings based on observed play."""
+        return compute_bet_sizes(self._observed_bet_pcts)
+
+    def get_street_actions(self, game_state, solver_inputs):
+        # type: (...) -> List[Dict[str, object]]
+        """Build street_actions for the solver based on current bets.
+
+        Returns list of {"action": str, "amount": float} dicts representing
+        actions already played on this street before hero's decision.
+        The solver expects OOP to act first.
+        """
+        if not solver_inputs or game_state.street == "preflop":
+            return []
+
+        oop_pos = solver_inputs["oop_position"]
+        ip_pos = solver_inputs["ip_position"]
+        hero_position = solver_inputs.get("hero_position", "")
+
+        # Find current bets for OOP and IP players
+        positions = self._positions or game_state.infer_positions()
+        oop_bet = 0.0
+        ip_bet = 0.0
+        for p in game_state.players:
+            if p.is_sitting_out or p.is_folded:
+                continue
+            pos = positions.get(p.seat, "")
+            bet = p.current_bet_bb or 0.0
+            if pos == oop_pos:
+                oop_bet = bet
+            elif pos == ip_pos:
+                ip_bet = bet
+
+        # If OCR missed villain's bet but hero has a Call option, infer the bet
+        aa = game_state.available_actions or {}
+        call_amount = aa.get("call")
+        if call_amount is not None and call_amount > 0 and oop_bet == 0 and ip_bet == 0:
+            # Someone bet but we didn't detect it — use call amount
+            if hero_position == "oop":
+                ip_bet = call_amount
+            elif hero_position == "ip":
+                oop_bet = call_amount
+
+        actions = []  # type: List[Dict[str, object]]
+
+        if oop_bet == 0 and ip_bet == 0:
+            # No bets yet — we're at the root
+            return []
+
+        if hero_position == "oop":
+            # Hero is OOP and it's their turn.
+            # If IP has bet, OOP must have checked first, then IP bet.
+            if ip_bet > 0:
+                actions.append({"action": "check", "amount": 0.0})
+                actions.append({"action": "bet", "amount": ip_bet})
+            # If only OOP has bet, that means OOP already bet — we're past that
+            # (hero wouldn't have action buttons if they already bet)
+            return actions
+
+        elif hero_position == "ip":
+            # Hero is IP and it's their turn.
+            if oop_bet > 0:
+                # OOP bet, hero faces it
+                actions.append({"action": "bet", "amount": oop_bet})
+            # If no OOP bet, hero is acting first as IP (after OOP check)
+            # That's the natural root flow: OOP checks, then IP acts
+            # But the solver tree starts with OOP, so we need "check"
+            elif oop_bet == 0 and ip_bet == 0:
+                # OOP checked, IP to act — need to play the check
+                actions.append({"action": "check", "amount": 0.0})
+            return actions
+
+        return []
+
     def _reset(self):
         self.current_hand_id = None
         self.preflop_action = None
@@ -478,3 +664,7 @@ class HandTracker:
         self._preflop_seen = False
         self._locked_dealer = None
         self._locked_solver = None
+        self._last_street = "preflop"
+        self._prev_bets = {}
+        self._observed_bet_pcts = []
+        self.postflop_actions = {}

@@ -1,4 +1,4 @@
-"""OCR using macOS Vision framework — far more accurate than Tesseract for ACR Poker."""
+"""OCR using macOS Vision framework — accurate text recognition for game client."""
 
 from typing import Optional, List, Tuple
 import re
@@ -11,7 +11,7 @@ from Quartz import CGImageSourceCreateWithURL, CGImageSourceCreateImageAtIndex
 from Foundation import NSURL
 
 # Temp file for passing crops to Vision API
-_TMP_PATH = "/tmp/acr_ocr_crop.png"
+_TMP_PATH = "/tmp/_vmon_crop.png"
 
 
 def _vision_ocr_file(img_path: str) -> List[Tuple[str, float]]:
@@ -59,9 +59,9 @@ def ocr_crop_all(img: np.ndarray, tmp_path: str = _TMP_PATH) -> List[str]:
 
 
 def _fix_bb_text(text: str) -> str:
-    """Fix common OCR misreads in ACR's font.
+    """Fix common OCR misreads in the client font.
 
-    The ACR font causes consistent misreads:
+    The client font causes consistent misreads:
     - 'BR' should be 'BB'
     - 'RR' should be 'BB'
     - 'R8' should be 'BB'

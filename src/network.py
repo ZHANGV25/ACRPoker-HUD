@@ -1,4 +1,4 @@
-"""Network layer: send game state from Mac (OCR) to PC (solver) over ZeroMQ."""
+"""Network layer: send extracted state from Mac to PC over ZeroMQ."""
 
 import json
 import time
@@ -6,7 +6,7 @@ import zmq
 
 
 class GameStateSender:
-    """Sends game state JSON to the solver PC over ZeroMQ PUB socket."""
+    """Sends game state JSON to the engine PC over ZeroMQ PUB socket."""
 
     def __init__(self, bind_addr: str = "tcp://*:5555"):
         self.ctx = zmq.Context()
@@ -27,9 +27,9 @@ class GameStateSender:
 
 
 class GameStateReceiver:
-    """Receives game state JSON from the Mac over ZeroMQ SUB socket.
+    """Receives game state JSON over ZeroMQ SUB socket.
 
-    Run this on the PC side.
+    Run this on the receiver side.
     """
 
     def __init__(self, connect_addr: str = "tcp://localhost:5555"):

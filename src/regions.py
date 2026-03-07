@@ -1,9 +1,9 @@
-"""Region definitions for ACR Poker 6-max table layout.
+"""Region definitions for 6-max table layout.
 
 All coordinates are defined as ratios (0.0 - 1.0) of the window dimensions,
 so they work at any resolution. Multiply by window width/height to get pixels.
 
-Calibrated from ACR Poker BB mode screenshots (~1590x1190).
+Calibrated from BB mode screenshots (~1590x1190).
 """
 
 from dataclasses import dataclass
@@ -34,7 +34,7 @@ class Region:
 
 
 def extract_table_area(img: np.ndarray, threshold: int = 10) -> np.ndarray:
-    """Auto-detect and crop to the ACR Poker window content area.
+    """Auto-detect and crop to the target application window content area.
 
     Full-screen captures have black padding around the game window.
     Window captures have no padding and are returned unchanged.

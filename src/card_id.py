@@ -1,4 +1,4 @@
-"""Card identification for ACR Poker — rank and suit detection.
+"""Card identification — rank and suit detection.
 
 Uses template matching for rank identification (most reliable for fixed-font game client)
 and color/shape analysis for suit detection.
@@ -255,6 +255,15 @@ def _read_rank(card_img: np.ndarray) -> Optional[str]:
         else:
             rank = _disambiguate_6_9(char_norm)
 
+    # Disambiguate 5/6 if needed
+    if rank in ('5', '6') and score < 0.95:
+        other = '5' if rank == '6' else '6'
+        other_score = _match_rank_single(char_norm, other)
+        if score - other_score > 0.05:
+            pass  # Template clearly favors this rank
+        else:
+            rank = _disambiguate_5_6(char_norm)
+
     return rank
 
 
@@ -282,24 +291,30 @@ def _has_one_digit_left(rank_roi: np.ndarray, char_norm: np.ndarray) -> bool:
         if c is largest:
             continue
         cx, cy, cw, ch_c = cv2.boundingRect(c)
+        # Must be tall enough (absolute minimum to filter tiny border fragments)
+        if ch_c < 10:
+            continue
         if ch_c < lh * 0.5:
             continue
         # Must be to the left of the largest contour
         if cx + cw > lx:
             continue
         # Must be narrow (like a '1')
-        if cw >= ch_c * 0.6:
+        if cw >= ch_c * 0.5:
             continue
-        # Must have sufficient fill ratio (real '1' > 0.28, border < 0.22)
+        # Must have sufficient fill ratio (real '1' > 0.30, border/artifact < 0.25)
         area = cv2.contourArea(c)
-        if area / (cw * ch_c) < 0.28:
+        if area / (cw * ch_c) < 0.30:
             continue
-        # Must be close to the '0' (gap < 50% of '0' width)
+        # Must be close to the '0' (gap < 40% of '0' width, and not overlapping)
         gap = lx - (cx + cw)
-        if gap > lw * 0.5:
+        if gap < 0 or gap > lw * 0.4:
             continue
-        # The '0' should be round-ish (width > 40% of height)
-        if lw < lh * 0.4:
+        # Must be vertically aligned with the '0' (top within 25% of '0' height)
+        if abs(cy - ly) > lh * 0.25:
+            continue
+        # The '0' should be round-ish (width > 45% of height)
+        if lw < lh * 0.45:
             continue
         return True
 
@@ -321,6 +336,25 @@ def _disambiguate_6_9(char_img: np.ndarray) -> str:
     return '9' if top_ink > bottom_ink else '6'
 
 
+def _disambiguate_5_6(char_img: np.ndarray) -> str:
+    """Distinguish 5 from 6 by top-row ink distribution.
+
+    '5' has a wide horizontal bar at the very top spanning most of the width.
+    '6' curves from the right — the top rows are narrower.
+    """
+    h, w = char_img.shape[:2]
+    # Look at top 20% of character
+    top_rows = max(h // 5, 3)
+    top = char_img[:top_rows, :]
+    # Count how many columns have ink in the top portion
+    ink_cols = (top > 127).any(axis=0)
+    ink_span = int(ink_cols.sum())
+    # '5' has a horizontal bar spanning >55% of width at top
+    if ink_span > w * 0.55:
+        return '5'
+    return '6'
+
+
 def _suit_from_rank_color(rank_roi: np.ndarray,
                           four_color: bool = False) -> Optional[str]:
     """Detect suit from the color of the rank text (4-color deck).
@@ -340,20 +374,19 @@ def _suit_from_rank_color(rank_roi: np.ndarray,
     if total < 10:
         return None
 
-    green = int(np.sum((h >= 35) & (h <= 85) & (s > 50) & (v > 50) & text_px))
-    blue = int(np.sum((h >= 100) & (h <= 135) & (s > 50) & (v > 50) & text_px))
+    green = int(np.sum((h >= 35) & (h <= 85) & (s > 40) & (v > 40) & text_px))
+    blue = int(np.sum((h >= 100) & (h <= 135) & (s > 40) & (v > 40) & text_px))
     red1 = int(np.sum((h <= 10) & (s > 50) & (v > 50) & text_px))
     red2 = int(np.sum((h >= 170) & (s > 50) & (v > 50) & text_px))
     red = red1 + red2
     black = int(np.sum((v < 120) & (s < 80) & text_px))
 
     threshold = max(total * 0.15, 5)
-    # Green/blue must dominate clearly — if black is also significant,
-    # the green may be from an overlapping action label (e.g. "C/C/C"),
-    # not the actual rank text.
-    if green > threshold and green > blue and green > black * 3:
+    # Green/blue must dominate — relaxed for small windows where dark edges
+    # inflate black count.
+    if green > threshold and green > blue and green > black * 2:
         return 'c'
-    if blue > threshold and blue > green and blue > black * 3:
+    if blue > threshold and blue > green and blue > black * 2:
         return 'd'
     if four_color:
         if red > threshold and red > black:
@@ -383,10 +416,10 @@ def _check_4color_pip(roi: np.ndarray) -> Optional[str]:
         return None
 
     green = int(np.sum((h >= 35) & (h <= 85) & (s > 50) & (v > 50) & non_white))
-    blue = int(np.sum((h >= 100) & (h <= 135) & (s > 50) & (v > 50) & non_white))
+    blue = int(np.sum((h >= 90) & (h <= 140) & (s > 40) & (v > 40) & non_white))
     black = int(np.sum((v < 120) & (s < 80) & non_white))
 
-    threshold = max(total * 0.15, 5)
+    threshold = max(total * 0.10, 3)
     # Green/blue must exceed both threshold AND black count to avoid
     # false positives from dark spade/club pixels with slight color cast.
     if green > threshold and green > blue and green > black:

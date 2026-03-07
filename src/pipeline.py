@@ -17,7 +17,7 @@ from src.vision_ocr import (
 from src.card_id import detect_and_identify_board, detect_and_identify_hero, detect_dealer_button
 from src.game_state import GameState, PlayerState
 
-# Words that ACR overlays on top of or near player names (results, actions)
+# Words that UI overlays on top of or near player names (results, actions)
 _ACTION_WORDS = frozenset({
     "FOLD", "CALL", "CHECK", "RAISE", "BET", "ALLIN", "ALL-IN",
     "MUCK", "SHOW", "DON'T SHOW", "DONT SHOW", "DON'T", "DONT",
@@ -55,6 +55,38 @@ def _clean_name(raw):
 
 
 
+def _infer_dealer_from_bets(state):
+    # type: (GameState) -> int | None
+    """Infer dealer seat from blind bets on preflop.
+
+    The 0.5 BB bet uniquely identifies the SB. Dealer is the seat before SB.
+    Only works preflop before blinds are consumed.
+    """
+    if state.street != "preflop":
+        return None
+
+    active = [p for p in state.players if not p.is_sitting_out]
+    active_seats = sorted([p.seat for p in active])
+    if len(active_seats) < 2:
+        return None
+
+    # Find the unique 0.5 BB bettor (SB)
+    sb_candidates = [p for p in active
+                     if p.current_bet_bb is not None
+                     and 0.4 <= p.current_bet_bb <= 0.6]
+    if len(sb_candidates) != 1:
+        return None
+
+    sb_seat = sb_candidates[0].seat
+    try:
+        sb_idx = active_seats.index(sb_seat)
+    except ValueError:
+        return None
+
+    dealer_idx = (sb_idx - 1) % len(active_seats)
+    return active_seats[dealer_idx]
+
+
 def process_screenshot(img: np.ndarray) -> GameState:
     """Process a single screenshot into a GameState.
 
@@ -87,7 +119,7 @@ def process_screenshot(img: np.ndarray) -> GameState:
     hero_crop = HERO_CARDS.crop(img)
     state.hero_cards = detect_and_identify_hero(hero_crop)
 
-    # Dealer button
+    # Dealer button (visual detection first, validated by bets after players are read)
     state.dealer_seat = detect_dealer_button(img)
 
     # Players
@@ -123,6 +155,11 @@ def process_screenshot(img: np.ndarray) -> GameState:
             player.is_hero = True
 
         state.players.append(player)
+
+    # Validate/fix dealer seat using blind bets (more reliable than visual on preflop)
+    bet_dealer = _infer_dealer_from_bets(state)
+    if bet_dealer is not None:
+        state.dealer_seat = bet_dealer
 
     # Action buttons
     state.available_actions = read_action_buttons(

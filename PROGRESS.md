@@ -2,8 +2,6 @@
 
 ## Architecture
 ```
-All on Mac — no network, no second machine.
-
 ACR Poker window
     |
     v
@@ -17,7 +15,7 @@ vision_ocr.py (stacks,        regions.py (ratio-based coords)
  pot, actions, bets)
     |
     v
-game_state.py -----> watch.py (live loop)
+game_state.py -----> watch.py (live loop + smoothing)
                         |
                         v
                     action_history.py (preflop reconstruction)
@@ -27,7 +25,7 @@ game_state.py -----> watch.py (live loop)
                     solver-cli (Rust, wraps postflop-solver)
                         |
                         v
-                    Print strategy in separate terminal window
+                    ui.py (macOS overlay window)
 ```
 
 ## Phase 0: Mac OCR Pipeline -- COMPLETE
@@ -46,7 +44,7 @@ game_state.py -----> watch.py (live loop)
 
 ## Phase 1: Preflop Range Lookup -- COMPLETE
 - ~35 GTO 6-max cash ranges encoded in JSON
-- Scenarios: RFI per position, call/3bet vs each position
+- Scenarios: RFI per position, call/3bet vs each position, vs-3bet call/4bet
 - Files: `solver/ranges.json`, `solver/range_lookup.py`
 
 ## Phase 2: Action Sequence Reconstruction -- COMPLETE
@@ -55,22 +53,33 @@ game_state.py -----> watch.py (live loop)
 - HandTracker locks dealer seat and solver inputs per hand
 - File: `solver/action_history.py`
 
-## Phase 3: Rust Solver CLI -- NOT STARTED
-- Wrap b-inary/postflop-solver in a Rust CLI binary
-- Input: JSON (board, ranges, pot, stacks, bet sizes)
+## Phase 3: Rust Solver CLI -- COMPLETE
+- Wraps b-inary/postflop-solver in a Rust CLI binary
+- Input: JSON (board, ranges, pot, stacks, bet sizes, street actions)
 - Output: JSON (action frequencies + EV for hero's hand)
-- Runs locally on Mac, called from watch.py
-- File: `solver/solver-cli/` (Rust crate)
+- Runs locally on Mac, called from watch.py in a background thread
+- Solves turn/river (flop disabled — too slow for live play)
+- File: `solver/solver-cli/src/main.rs`
 
-## Phase 4: Integration -- NOT STARTED
-- watch.py calls solver-cli when new street detected
-- Display strategy (fold/call/raise %, EV) in terminal output
-- Solver runs in background, result shown when ready
+## Phase 4: Integration -- COMPLETE
+- watch.py calls solver-cli when new street detected + hero has action
+- Display strategy (fold/call/raise %, EV) in overlay or terminal
+- Solver runs in background thread, result shown when ready
+- EngineRunner handles key dedup, street invalidation, timeout
 
-## Phase 5: Multi-Table -- NOT STARTED
-- Parallel pipeline instances per window
+## Phase 5: Multi-Table -- COMPLETE
+- Parallel pipeline instances per window (watch.py TableState)
+- Per-table HandTracker, ReadingSmoother, EngineRunner
+
+## Phase 6: Overlay UI -- COMPLETE
+- Native macOS AppKit overlay window (ui.py)
+- Clean layout: hero info, strategy (front and center), players, debug
+- Preflop advice displayed prominently with visual borders
+- Background capture thread with timer-based UI updates
 
 ## OCR Reliability (live-tested)
+- Hero card OCR gated on action buttons (skips small/minimized view)
+- First 2 frames after action appears are skipped (transition settling)
 - Forced 4-color mode for hero cards; green contamination guard
 - Board pip width ratio threshold 2.0 for spade/club disambiguation
 - Hero card 2: reject chars <14px wide to avoid partial-occlusion misreads
@@ -78,29 +87,33 @@ game_state.py -----> watch.py (live loop)
 - Temporal smoothing with lock-in + duplicate hero card rejection
 - HandTracker locks dealer seat, IP/OOP, ranges per hand
 - Expanded action word filtering for OCR garble
+- Preflop advice cross-validates call amounts against actual player bets
 
 ## Known Issues
 - Dollar mode tables: stacks/pot read as garbage (only BB mode works)
+- OCR occasionally misreads decimals (e.g. "0.5" -> "5.0")
 - Board card turn/river order occasionally swaps (rare)
 
 ## File Structure
 ```
 poker/
+  ui.py                          - macOS overlay UI (AppKit)
+  monitor.py                     - Simple monitor launcher
   src/
-    capture.py               - Window capture (macOS Quartz API)
-    regions.py               - Table region coordinates (ratio-based)
-    vision_ocr.py            - macOS Vision OCR
-    card_id.py               - Card identification (rank + suit)
-    game_state.py            - Game state model
-    pipeline.py              - Main OCR pipeline
-    watch.py                 - Live watcher + solver integration
+    capture.py                   - Window capture (macOS Quartz API)
+    regions.py                   - Table region coordinates (ratio-based)
+    vision_ocr.py                - macOS Vision OCR
+    card_id.py                   - Card identification (rank + suit)
+    game_state.py                - Game state model
+    pipeline.py                  - Main OCR pipeline
+    watch.py                     - Live watcher + solver integration
   solver/
-    ranges.json              - Preflop range lookup table
-    range_lookup.py          - Range lookup by position + scenario
-    action_history.py        - Action reconstruction + HandTracker
-    solver-cli/              - Rust CLI wrapping postflop-solver (TODO)
+    ranges.json                  - Preflop range lookup table
+    range_lookup.py              - Range lookup by position + scenario
+    action_history.py            - Action reconstruction + HandTracker
+    solver-cli/                  - Rust CLI wrapping postflop-solver
   templates/
-    card_ranks/              - Card rank templates (all 13 ranks)
+    card_ranks/                  - Card rank templates (all 13 ranks)
   tests/
   reference_screenshots/
 ```

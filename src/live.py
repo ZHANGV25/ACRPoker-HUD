@@ -1,6 +1,6 @@
-"""Live window capture loop for ACR Poker OCR pipeline.
+"""Live window capture loop for OCR pipeline.
 
-Polls for ACR Poker table windows, detects when it is the hero's turn
+Polls for target application table windows, detects when it is the hero's turn
 (action buttons visible), runs the full OCR pipeline, and prints the
 resulting game state as JSON.
 
@@ -15,7 +15,7 @@ import time
 import cv2
 import numpy as np
 
-from src.capture import find_acr_windows, capture_window
+from src.capture import find_target_windows, capture_window
 from src.pipeline import process_screenshot
 from src.regions import FOLD_BUTTON, CALL_CHECK_BUTTON, RAISE_BET_BUTTON
 
@@ -36,7 +36,7 @@ BUTTON_SATURATION_THRESH = 30  # min mean saturation for coloured button detecti
 def _region_is_active(img: np.ndarray, region) -> bool:
     """Check if a button region contains a visible button.
 
-    ACR action buttons are brightly coloured rectangles (green / blue / red).
+    Action buttons are brightly coloured rectangles (green / blue / red).
     When no buttons are shown the region is dark table felt.  A simple
     brightness + saturation check is enough as a pre-filter.
     """
@@ -80,7 +80,7 @@ def run(window_index: int = 0) -> None:
     """Run the live capture loop.
 
     Args:
-        window_index: Which ACR window to track when multiple are found
+        window_index: Which target window to track when multiple are found
                       (0 = first window discovered).
     """
     global _running
@@ -88,22 +88,22 @@ def run(window_index: int = 0) -> None:
 
     signal.signal(signal.SIGINT, _handle_sigint)
 
-    print("[live] ACR Poker live capture starting.  Press Ctrl+C to quit.")
+    print("[live] Live capture starting.  Press Ctrl+C to quit.")
 
     tracked_window_id = None
     tracked_window_title = None
 
     while _running:
-        # ---- 1. Find / re-find ACR windows --------------------------------
+        # ---- 1. Find / re-find target windows ------------------------------
         try:
-            windows = find_acr_windows()
+            windows = find_target_windows()
         except RuntimeError as exc:
             print(f"[live] Fatal: {exc}", file=sys.stderr)
             return
 
         if not windows:
             if tracked_window_id is not None:
-                print("[live] ACR window lost.  Waiting for a new window...")
+                print("[live] Target window lost.  Waiting for a new window...")
                 tracked_window_id = None
                 tracked_window_title = None
             time.sleep(POLL_INTERVAL)
@@ -169,13 +169,13 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="ACR Poker live capture — polls table window and runs OCR on hero's turn."
+        description="Live capture — polls table window and runs OCR on hero's turn."
     )
     parser.add_argument(
         "-w", "--window-index",
         type=int,
         default=0,
-        help="Index of the ACR window to track when multiple are open (default: 0).",
+        help="Index of the target window to track when multiple are open (default: 0).",
     )
     args = parser.parse_args()
 

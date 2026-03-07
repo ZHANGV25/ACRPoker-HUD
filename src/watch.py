@@ -1,11 +1,11 @@
-"""Live watcher — continuously captures ACR Poker and shows readable game state.
+"""Live monitor — continuously captures target application and shows readable game state.
 
 Runs OCR on every detected state change and prints a formatted summary
-including board, hero cards, positions, actions, and solver inputs.
-Supports multi-table: tracks all expanded ACR windows independently.
+including board, hero cards, positions, actions, and engine inputs.
+Supports multi-table: tracks all expanded windows independently.
 
 Usage:
-    python -m src.watch              # live capture from ACR window(s)
+    python -m src.watch              # live capture from target window(s)
     python -m src.watch -f file.png  # single screenshot (for testing)
     python -m src.watch --all        # capture every poll, not just changes
 """
@@ -22,7 +22,7 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
-from src.capture import find_acr_windows, capture_window, capture_from_file
+from src.capture import find_target_windows, capture_window, capture_from_file
 from src.pipeline import process_screenshot
 from src.regions import FOLD_BUTTON, CALL_CHECK_BUTTON, RAISE_BET_BUTTON
 from src.game_state import GameState
@@ -30,13 +30,13 @@ from solver.range_lookup import RangeLookup
 from solver.action_history import HandTracker, reconstruct_preflop, determine_solver_inputs
 
 POLL_INTERVAL = 0.8
-MIN_WINDOW_WIDTH = 750  # Skip tiled multi-table windows (expanded ~800pt, tiled ~600pt)
-SMOOTH_WINDOW = 3       # Number of recent reads to vote on for stabilization
+MIN_WINDOW_WIDTH = 450  # Skip lobby/minimized windows, allow small table views
+SMOOTH_WINDOW = 5       # Number of recent reads to vote on for stabilization
 
-# Path to solver binary (built with cargo build --release)
-SOLVER_BIN = os.path.join(
+# Path to engine binary (built with cargo build --release)
+ENGINE_BIN = os.path.join(
     os.path.dirname(os.path.dirname(__file__)),
-    "solver", "solver-cli", "target", "release", "solver-cli"
+    "solver", "solver-cli", "target", "release", "tbl-engine"
 )
 
 
@@ -51,7 +51,8 @@ class ReadingSmoother:
     for the rest of the hand. Resets on new hand_id or new street (for board).
     """
 
-    LOCK_THRESHOLD = 2  # reads before locking in
+    LOCK_THRESHOLD = 2  # reads before locking in (board cards)
+    HERO_LOCK_THRESHOLD = 2  # lock hero cards after 2 consistent reads
 
     def __init__(self, window=SMOOTH_WINDOW):
         # type: (int) -> None
@@ -62,18 +63,32 @@ class ReadingSmoother:
         self._board_locked = {}    # type: Dict[int, str]
         self._current_hand_id = None  # type: Optional[str]
         self._current_board_len = 0
+        self._hero_action_skip = 0  # frames to skip after action appears
 
-    def update(self, gs):
-        # type: (GameState) -> GameState
-        """Smooth hero cards and board across recent reads. Mutates gs in place."""
+    def update(self, gs, hero_has_action=False):
+        # type: (GameState, bool) -> GameState
+        """Smooth hero cards and board across recent reads. Mutates gs in place.
+
+        hero_has_action: only accumulate/lock hero cards when True.
+        Before hero's turn the view is small and OCR is unreliable.
+        """
         # Reset on new hand
         if gs.hand_id != self._current_hand_id:
-            self._hero_history.clear()
-            self._hero_locked.clear()
             self._board_history.clear()
             self._board_locked.clear()
             self._current_hand_id = gs.hand_id
             self._current_board_len = 0
+
+            # Only reset hero locks if the card RANKS clearly changed
+            # (hand_id can flicker from OCR while hero still has same cards)
+            if self._hero_locked and gs.hero_cards:
+                new_ranks = sorted(c[0] for c in gs.hero_cards if c and len(c) >= 1)
+                old_ranks = sorted(c[0] for c in self._hero_locked.values() if c and len(c) >= 1)
+                if new_ranks != old_ranks:
+                    self._hero_history.clear()
+                    self._hero_locked.clear()
+            elif not self._hero_locked:
+                self._hero_history.clear()
 
         # Reset board locks when new cards appear (street change)
         board_len = len(gs.board) if gs.board else 0
@@ -82,17 +97,30 @@ class ReadingSmoother:
             self._board_locked.clear()
             self._current_board_len = board_len
 
-        # Hero cards: lock-in + vote
-        if gs.hero_cards:
+        # Hero cards: only accumulate/lock when hero has action (view is big)
+        # Skip first 2 frames after action appears (view may still be transitioning)
+        if not hero_has_action:
+            self._hero_action_skip = 0
+        elif self._hero_action_skip < 2:
+            self._hero_action_skip += 1
+            gs.hero_cards = None
+
+        if gs.hero_cards and hero_has_action:
             self._hero_history.append(tuple(gs.hero_cards))
             if len(self._hero_history) > self._window:
                 self._hero_history.pop(0)
             gs.hero_cards = list(self._resolve(
-                self._hero_history, len(gs.hero_cards), self._hero_locked))
+                self._hero_history, len(gs.hero_cards), self._hero_locked,
+                threshold=self.HERO_LOCK_THRESHOLD))
             # Reject impossible duplicates (e.g. 3s 3s) — unlock both
             if len(gs.hero_cards) == 2 and gs.hero_cards[0] == gs.hero_cards[1]:
                 self._hero_locked.pop(0, None)
                 self._hero_locked.pop(1, None)
+        elif gs.hero_cards and self._hero_locked:
+            # Not hero's turn but we have prior locks — use them
+            gs.hero_cards = list(self._resolve(
+                [tuple(gs.hero_cards)], len(gs.hero_cards), self._hero_locked,
+                threshold=self.HERO_LOCK_THRESHOLD))
 
         # Board cards: lock-in + vote
         if gs.board:
@@ -106,9 +134,16 @@ class ReadingSmoother:
 
         return gs
 
-    def _resolve(self, history, num_cards, locked):
-        # type: (List[Tuple], int, Dict[int, str]) -> Tuple
-        """Per-position: return locked value if available, else majority vote."""
+    def _resolve(self, history, num_cards, locked, threshold=None):
+        # type: (List[Tuple], int, Dict[int, str], Optional[int]) -> Tuple
+        """Per-position: return locked value if available, else majority vote.
+
+        Only locks when the last `threshold` reads are consecutively identical.
+        This prevents wrong locks from a run of bad reads.
+        Always shows the majority vote while waiting for lock.
+        """
+        if threshold is None:
+            threshold = self.LOCK_THRESHOLD
         result = []
         for i in range(num_cards):
             if i in locked:
@@ -120,9 +155,13 @@ class ReadingSmoother:
                 result.append(None)
                 continue
 
-            best, count = Counter(cards_at_pos).most_common(1)[0]
-            if count >= self.LOCK_THRESHOLD:
-                locked[i] = best
+            best, _count = Counter(cards_at_pos).most_common(1)[0]
+            # Lock only when last `threshold` reads are all identical (consecutive)
+            if len(cards_at_pos) >= threshold:
+                recent = cards_at_pos[-threshold:]
+                if all(c == recent[0] for c in recent):
+                    locked[i] = recent[0]
+                    best = recent[0]
             result.append(best)
         return tuple(result)
 
@@ -131,8 +170,8 @@ class ReadingSmoother:
 # Solver integration
 # ─────────────────────────────────────────────────────────────────────────────
 
-class SolverRunner:
-    """Runs the Rust solver CLI in a background thread."""
+class EngineRunner:
+    """Runs the Rust engine CLI in a background thread."""
 
     def __init__(self):
         # type: () -> None
@@ -140,22 +179,43 @@ class SolverRunner:
         self._result = None  # type: Optional[dict]
         self._pending_key = None  # type: Optional[str]
         self._running = False
+        self.status = "idle"  # type: str  # idle, running, done, error
+        self.last_solve_time = 0.0
+        self.last_error = ""  # type: str
+        self._last_board_len = 0
 
-    def request(self, solver_inputs, hero_hand, hero_position, board):
-        # type: (dict, List[str], str, List[str]) -> None
+    def invalidate_on_street_change(self, board_len):
+        # type: (int) -> None
+        """Clear stale result when a new street card appears."""
+        if board_len > self._last_board_len:
+            with self._lock:
+                self._result = None
+                self._pending_key = None
+                self.status = "idle"
+            self._last_board_len = board_len
+
+    def request(self, solver_inputs, hero_hand, hero_position, board,
+                bet_sizes=None, street_actions=None):
+        # type: (dict, List[str], str, List[str], Optional[dict], Optional[list]) -> None
         """Request a solve in the background. Non-blocking."""
-        if not os.path.isfile(SOLVER_BIN):
+        if not os.path.isfile(ENGINE_BIN):
+            self.status = "error"
+            self.last_error = "binary not found"
             return
 
-        # Build a key to avoid re-solving the same spot
-        key = "{}|{}|{}".format(
-            ",".join(board), ",".join(hero_hand), hero_position)
+        sa_key = str(street_actions or [])
+        # Key includes pot/stack/street_actions so we re-solve on action changes
+        key = "{}|{}|{}|{:.0f}|{:.0f}|{}".format(
+            ",".join(board), ",".join(hero_hand), hero_position,
+            solver_inputs["starting_pot"], solver_inputs["effective_stack"],
+            sa_key)
         with self._lock:
             if key == self._pending_key:
                 return  # already solving or solved this spot
             self._pending_key = key
             self._result = None
 
+        bs = bet_sizes or {}
         solver_input = {
             "board": board,
             "oop_range": solver_inputs["oop_range"],
@@ -165,53 +225,69 @@ class SolverRunner:
             "hero_hand": hero_hand,
             "hero_position": hero_position,
             "max_iterations": 300,
-            "bet_sizes_oop": "66%, a",
-            "bet_sizes_ip": "66%, a",
-            "raise_sizes_oop": "2.5x",
-            "raise_sizes_ip": "2.5x",
+            "bet_sizes_oop": bs.get("bet_sizes_oop", "66%, a"),
+            "bet_sizes_ip": bs.get("bet_sizes_ip", "66%, a"),
+            "raise_sizes_oop": bs.get("raise_sizes_oop", "2.5x"),
+            "raise_sizes_ip": bs.get("raise_sizes_ip", "2.5x"),
+            "street_actions": street_actions or [],
         }
 
+        self.status = "running"
         thread = threading.Thread(
             target=self._solve, args=(key, solver_input), daemon=True)
         thread.start()
 
     def _solve(self, key, solver_input):
         # type: (str, dict) -> None
-        """Run solver-cli subprocess."""
+        """Run engine subprocess."""
+        t0 = time.time()
         try:
             proc = subprocess.run(
-                [SOLVER_BIN],
+                [ENGINE_BIN],
                 input=json.dumps(solver_input),
                 capture_output=True,
                 text=True,
                 timeout=120,
             )
+            elapsed = time.time() - t0
             if proc.returncode == 0:
                 result = json.loads(proc.stdout)
                 with self._lock:
                     if self._pending_key == key:
                         self._result = result
+                        self.status = "done"
+                        self.last_solve_time = elapsed
+                        self.last_error = ""
             else:
-                sys.stderr.write("[solver] Error: {}\n".format(
-                    proc.stderr.strip()))
+                err = proc.stderr.strip()
+                sys.stderr.write("[engine] Error: {}\n".format(err))
+                with self._lock:
+                    self.status = "error"
+                    self.last_error = err[:120]
         except subprocess.TimeoutExpired:
-            sys.stderr.write("[solver] Timed out after 120s\n")
+            sys.stderr.write("[engine] Timed out after 120s\n")
+            with self._lock:
+                self.status = "error"
+                self.last_error = "timeout (120s)"
         except Exception as exc:
-            sys.stderr.write("[solver] Exception: {}\n".format(exc))
+            sys.stderr.write("[engine] Exception: {}\n".format(exc))
+            with self._lock:
+                self.status = "error"
+                self.last_error = str(exc)[:120]
 
     def get_result(self):
         # type: () -> Optional[dict]
-        """Return the latest solver result, or None if not ready."""
+        """Return the latest engine result, or None if not ready."""
         with self._lock:
             return self._result
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Per-table state — each ACR window gets its own tracker
+# Per-table state — each target window gets its own tracker
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TableState:
-    """Tracks state for a single ACR table window."""
+    """Tracks state for a single table window."""
 
     def __init__(self, window_id, title, rl):
         # type: (int, str, RangeLookup) -> None
@@ -219,24 +295,35 @@ class TableState:
         self.title = title
         self.tracker = HandTracker()
         self.smoother = ReadingSmoother()
-        self.solver = SolverRunner()
+        self.engine = EngineRunner()
         self.rl = rl
         self.last_fingerprint = None  # type: Optional[str]
         self.last_printed = None  # type: Optional[str]
-        self.last_board_len = 0
 
     def process_frame(self, img, show_all=False):
         # type: (np.ndarray, bool) -> None
         """Process a single frame for this table."""
+        t_start = time.time()
         try:
             gs = process_screenshot(img)
         except Exception as exc:
             print("[table {}] Pipeline error: {}".format(
                 self.window_id, exc), file=sys.stderr)
             return
+        ocr_ms = (time.time() - t_start) * 1000
 
-        # Apply temporal smoothing
-        self.smoother.update(gs)
+        # Hero-has-action gating: must be computed before smoother
+        hero_has_action = bool(gs.available_actions and (
+            gs.available_actions.get("fold") or
+            gs.available_actions.get("check") or
+            gs.available_actions.get("call") is not None))
+
+        # When hero doesn't have action, view is small — suppress unreliable hero reads
+        if not hero_has_action and not self.smoother._hero_locked:
+            gs.hero_cards = None
+
+        # Apply temporal smoothing (hero cards only smoothed when view is big)
+        self.smoother.update(gs, hero_has_action=hero_has_action)
 
         fp = _state_fingerprint(gs)
         if not show_all and fp == self.last_fingerprint:
@@ -253,24 +340,37 @@ class TableState:
             except Exception:
                 pass
 
-        # Trigger solver when we have inputs + hero cards + board
+        # Invalidate stale solver result on street change
+        board_len = len(gs.board) if gs.board else 0
+        self.engine.invalidate_on_street_change(board_len)
+
+        # Trigger solver when we have inputs + hero cards + board + hero has action
+        # Only solve turn/river — flop is too slow for live play
         if solver_inputs and gs.hero_cards and len(gs.hero_cards) == 2:
             hero_pos = solver_inputs.get("hero_position", "")
-            if hero_pos and all(gs.hero_cards):
-                board_len = len(gs.board)
-                # Only solve turn+ (flop needs precomputed tables)
-                if board_len >= 4:
-                    self.solver.request(
-                        solver_inputs, gs.hero_cards, hero_pos, gs.board)
-                # New street → new solve needed
-                if board_len > self.last_board_len:
-                    self.last_board_len = board_len
+            if hero_pos and all(gs.hero_cards) and hero_has_action and board_len >= 4:
+                bet_sizes = self.tracker.get_bet_sizes()
+                street_actions = self.tracker.get_street_actions(gs, solver_inputs)
+                self.engine.request(
+                    solver_inputs, gs.hero_cards, hero_pos, gs.board,
+                    bet_sizes=bet_sizes, street_actions=street_actions)
 
         # Get solver result if available
-        solver_result = self.solver.get_result()
+        solver_result = self.engine.get_result()
+
+        # Build debug info
+        debug = {
+            "ocr_ms": ocr_ms,
+            "engine_status": self.engine.status,
+            "engine_time": self.engine.last_solve_time,
+            "engine_error": self.engine.last_error,
+            "hero_has_action": hero_has_action,
+            "hand_id": gs.hand_id,
+            "tracked_bets": len(self.tracker._observed_bet_pcts),
+        }
 
         output = _format_state(
-            gs, positions, preflop, solver_inputs, solver_result)
+            gs, positions, preflop, solver_inputs, solver_result, debug=debug)
 
         # Suppress duplicate output
         if output != self.last_printed:
@@ -291,8 +391,8 @@ def _card_str(cards):
     return " ".join(c if c else "??" for c in cards)
 
 
-def _format_state(gs, positions, preflop, solver_inputs, solver_result=None):
-    # type: (GameState, dict, ..., ..., ...) -> str
+def _format_state(gs, positions, preflop, solver_inputs, solver_result=None, debug=None):
+    # type: (GameState, dict, ..., ..., ..., ...) -> str
     """Build a human-readable summary of the game state."""
     lines = []
     lines.append("")
@@ -396,13 +496,35 @@ def _format_state(gs, positions, preflop, solver_inputs, solver_result=None):
     # Solver result
     if solver_result:
         lines.append("-" * 60)
-        lines.append("  SOLVER STRATEGY:")
+        lines.append("  ENGINE STRATEGY:")
         lines.append("    EV: {:.2f} BB  Equity: {:.1f}%".format(
             solver_result["ev"], solver_result["equity"] * 100))
         for a in solver_result["actions"]:
             if a["frequency"] > 0.005:
                 lines.append("    {:>20s}  {:.0f}%".format(
                     a["action"], a["frequency"] * 100))
+
+    # Debug info
+    if debug:
+        lines.append("-" * 60)
+        status = debug.get("engine_status", "?")
+        ocr_ms = debug.get("ocr_ms", 0)
+        solve_t = debug.get("engine_time", 0)
+        has_action = debug.get("hero_has_action", False)
+        hand_id = debug.get("hand_id", "?")
+        err = debug.get("engine_error", "")
+        n_bets = debug.get("tracked_bets", 0)
+
+        status_str = status
+        if status == "done" and solve_t > 0:
+            status_str = "done ({:.1f}s)".format(solve_t)
+        elif status == "error" and err:
+            status_str = "ERR: {}".format(err[:60])
+
+        lines.append("  DEBUG  ocr:{:.0f}ms  engine:{}  action:{}  bets:{}  hand:{}".format(
+            ocr_ms, status_str,
+            "YES" if has_action else "no",
+            n_bets, hand_id or "?"))
 
     lines.append("=" * 60)
     return "\n".join(lines)
@@ -438,7 +560,7 @@ def process_and_display(img, tracker, rl):
     try:
         gs = process_screenshot(img)
     except Exception as exc:
-        print("[watch] Pipeline error: {}".format(exc), file=sys.stderr)
+        print("[monitor] Pipeline error: {}".format(exc), file=sys.stderr)
         return None
 
     positions = gs.infer_positions()
@@ -499,7 +621,7 @@ def _capture_settled(window_id):
 
 def run_live(show_all=False):
     # type: (bool) -> None
-    """Continuously capture and display state changes for all ACR tables."""
+    """Continuously capture and display state changes for all target tables."""
     global _running
     _running = True
     signal.signal(signal.SIGINT, _handle_sigint)
@@ -507,20 +629,20 @@ def run_live(show_all=False):
     rl = RangeLookup()
     tables = {}  # type: Dict[int, TableState]
 
-    if os.path.isfile(SOLVER_BIN):
-        print("[watch] Solver binary found: {}".format(SOLVER_BIN))
+    if os.path.isfile(ENGINE_BIN):
+        print("[monitor] Engine binary found: {}".format(ENGINE_BIN))
     else:
-        print("[watch] Solver binary not found — solving disabled.")
-        print("[watch] Build with: cd solver/solver-cli && cargo build --release")
+        print("[monitor] Engine binary not found — engine disabled.")
+        print("[monitor] Build with: cd solver/solver-cli && cargo build --release")
 
-    print("[watch] ACR Poker watcher starting (multi-table). Press Ctrl+C to quit.")
+    print("[monitor] Monitor starting (multi-table). Press Ctrl+C to quit.")
 
     while _running:
-        # Find all ACR windows
+        # Find all target windows
         try:
-            windows = find_acr_windows()
+            windows = find_target_windows()
         except RuntimeError as exc:
-            print("[watch] Fatal: {}".format(exc), file=sys.stderr)
+            print("[monitor] Fatal: {}".format(exc), file=sys.stderr)
             return
 
         # Filter to expanded windows only (skip tiled)
@@ -528,7 +650,7 @@ def run_live(show_all=False):
 
         if not expanded:
             if tables:
-                print("[watch] All ACR windows lost. Waiting...")
+                print("[monitor] All target windows lost. Waiting...")
                 tables.clear()
             time.sleep(POLL_INTERVAL)
             continue
@@ -537,14 +659,14 @@ def run_live(show_all=False):
         active_ids = {w["id"] for w in expanded}
         for wid in list(tables.keys()):
             if wid not in active_ids:
-                print("[watch] Table {} lost.".format(wid))
+                print("[monitor] Table {} lost.".format(wid))
                 del tables[wid]
 
         for win in expanded:
             wid = win["id"]
             if wid not in tables:
                 tables[wid] = TableState(wid, win["title"], rl)
-                print("[watch] Tracking table: {} ({}x{})".format(
+                print("[monitor] Tracking table: {} ({}x{})".format(
                     win["title"], win["bounds"]["w"], win["bounds"]["h"]))
 
         # Process each table
@@ -556,7 +678,7 @@ def run_live(show_all=False):
 
         time.sleep(POLL_INTERVAL)
 
-    print("\n[watch] Stopped.")
+    print("\n[monitor] Stopped.")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -567,7 +689,7 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="ACR Poker watcher — live state display with action reconstruction."
+        description="Live monitor — state display with action reconstruction."
     )
     parser.add_argument(
         "-f", "--file",
