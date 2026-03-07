@@ -12,6 +12,7 @@ from typing import Optional, Dict
 
 from solver.hh_parser import parse_hand, RE_HAND_HEADER
 from solver.player_stats import StatsDB, PlayerHUDStats
+from solver.fuzzy_name import fuzzy_match
 
 # Default ACR hand history directory
 DEFAULT_HH_DIR = os.path.expanduser(
@@ -39,6 +40,8 @@ class HHWatcher:
         self._thread = None  # type: Optional[threading.Thread]
         self._lock = threading.Lock()
         self._stats_cache = {}  # type: Dict[str, PlayerHUDStats]
+        self._name_resolve_cache = {}  # type: Dict[str, Optional[str]]  # ocr_name -> hh_name
+        self._known_names = set()  # type: set  # all player names from hand history
         self._cache_dirty = True
         self._hands_imported = 0
 
@@ -92,6 +95,7 @@ class HHWatcher:
             if n > 0:
                 self._hands_imported += n
                 self._cache_dirty = True
+                self._name_resolve_cache.clear()  # new names may have appeared
 
     def _process_file(self, filepath):
         # type: (str) -> int
@@ -106,6 +110,9 @@ class HHWatcher:
         hands = _parse_content(content)
         count = 0
         for h in hands:
+            # Collect known player names
+            for _, (name, _) in h.seats.items():
+                self._known_names.add(name)
             if not self._db.has_hand(h.hand_id):
                 self._db.record_hand(h)
                 count += 1
@@ -137,20 +144,36 @@ class HHWatcher:
         hands = _parse_content(new_data)
         count = 0
         for h in hands:
+            for _, (name, _) in h.seats.items():
+                self._known_names.add(name)
             if not self._db.has_hand(h.hand_id):
                 self._db.record_hand(h)
                 count += 1
         return count
 
-    def get_player_stats(self, name):
+    def _resolve_name(self, ocr_name):
+        # type: (str) -> Optional[str]
+        """Resolve an OCR-read name to a known hand history name."""
+        if not ocr_name:
+            return None
+        # Check cache first
+        if ocr_name in self._name_resolve_cache:
+            return self._name_resolve_cache[ocr_name]
+        resolved = fuzzy_match(ocr_name, self._known_names)
+        self._name_resolve_cache[ocr_name] = resolved
+        return resolved
+
+    def get_player_stats(self, ocr_name):
         # type: (str) -> PlayerHUDStats
-        """Get stats for a specific player."""
+        """Get stats for a player, using fuzzy name matching for OCR errors."""
+        resolved = self._resolve_name(ocr_name)
+        lookup = resolved or ocr_name
         with self._lock:
-            if name in self._stats_cache and not self._cache_dirty:
-                return self._stats_cache[name]
-        stats = self._db.get_stats(name)
+            if lookup in self._stats_cache and not self._cache_dirty:
+                return self._stats_cache[lookup]
+        stats = self._db.get_stats(lookup)
         with self._lock:
-            self._stats_cache[name] = stats
+            self._stats_cache[lookup] = stats
         return stats
 
     def get_all_stats(self, min_hands=5):
