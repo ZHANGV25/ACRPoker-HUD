@@ -25,7 +25,7 @@ from solver.range_lookup import RangeLookup
 from solver.action_history import HandTracker, reconstruct_preflop, determine_solver_inputs
 
 POLL_INTERVAL = 0.8
-MIN_WINDOW_WIDTH = 700  # Skip tiled multi-table windows (expanded ~800pt, tiled ~600pt)
+MIN_WINDOW_WIDTH = 750  # Skip tiled multi-table windows (expanded ~800pt, tiled ~600pt)
 SMOOTH_WINDOW = 3       # Number of recent reads to vote on for stabilization
 
 
@@ -78,6 +78,10 @@ class ReadingSmoother:
                 self._hero_history.pop(0)
             gs.hero_cards = list(self._resolve(
                 self._hero_history, len(gs.hero_cards), self._hero_locked))
+            # Reject impossible duplicates (e.g. 3s 3s) — unlock both
+            if len(gs.hero_cards) == 2 and gs.hero_cards[0] == gs.hero_cards[1]:
+                self._hero_locked.pop(0, None)
+                self._hero_locked.pop(1, None)
 
         # Board cards: lock-in + vote
         if gs.board:
@@ -385,7 +389,7 @@ def run_live(window_index=0, show_all=False):
             solver_inputs = None
             if gs.board and len(gs.board) >= 3:
                 try:
-                    solver_inputs = determine_solver_inputs(gs, rl, hand_tracker=tracker)
+                    solver_inputs = tracker.get_solver_inputs(gs, rl)
                 except Exception:
                     pass
 

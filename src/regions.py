@@ -121,7 +121,7 @@ SEAT5_BET = Region(0.38, 0.61, 0.16, 0.08)
 
 # Seat 6: Bottom-left (e.g. cmooraces)
 SEAT6_NAME = Region(0.10, 0.76, 0.17, 0.03)
-SEAT6_STACK = Region(0.12, 0.79, 0.12, 0.03)
+SEAT6_STACK = Region(0.10, 0.79, 0.16, 0.03)
 SEAT6_ACTION = Region(0.18, 0.73, 0.05, 0.03)
 SEAT6_BET = Region(0.26, 0.61, 0.14, 0.08)
 

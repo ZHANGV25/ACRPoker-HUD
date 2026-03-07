@@ -46,7 +46,10 @@ def _clean_name(raw):
         if collapsed == word.replace(" ", ""):
             return ""
     # Common OCR misreads of action words
-    if collapsed in ("FOID", "FOLD", "FOIS", "FOLO", "CALI", "CHFCK", "RAISF"):
+    if collapsed in ("FOID", "FOLD", "FOIS", "FOLO", "TOLD", "CALI", "CHFCK", "RAISF"):
+        return ""
+    # Catch "SIT TING OUT", "SITTING O", etc.
+    if "SITTING" in collapsed or "SITOUT" in collapsed or "SITFING" in collapsed:
         return ""
     return raw.strip()
 

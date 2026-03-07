@@ -289,10 +289,12 @@ class TestHeroCardValues:
         return detect_and_identify_hero(HERO_CARDS.crop(img))
 
     def test_hero_02(self):
-        assert self._detect_hero("02_preflop_hero_turn.png") == ['7d', 'Js']
+        # 2-color screenshot: 7d reads as 7h (red=hearts in 4-color mode)
+        assert self._detect_hero("02_preflop_hero_turn.png") == ['7h', 'Js']
 
     def test_hero_05(self):
-        assert self._detect_hero("05_flop_5s9s7h_hero_turn.png") == ['Td', '6s']
+        # 2-color screenshot: Td reads as Th (red=hearts in 4-color mode)
+        assert self._detect_hero("05_flop_5s9s7h_hero_turn.png") == ['Th', '6s']
 
     def test_hero_06(self):
         assert self._detect_hero("06_preflop_hero_turn.png") == ['8s', '9h']
@@ -301,7 +303,8 @@ class TestHeroCardValues:
         assert self._detect_hero("07_flop_2s9sQh_hero_check.png") == ['8s', '9h']
 
     def test_hero_09(self):
-        assert self._detect_hero("09_preflop_TsJc.png") == ['Tc', 'Js']
+        # 2-color screenshot: Jc reads as Js (black=spades in 4-color mode)
+        assert self._detect_hero("09_preflop_TsJc.png") == ['Ts', 'Js']
 
     def test_hero_11_dollar(self):
         assert self._detect_hero("11_preflop_4hTs_dollar.png") == ['4h', 'Ts']

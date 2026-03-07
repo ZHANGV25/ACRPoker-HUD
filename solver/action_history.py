@@ -402,6 +402,7 @@ class HandTracker:
 
     Use with live.py: call update() on each new GameState.
     The tracker remembers preflop actions even after the board appears.
+    Locks dealer seat and solver matchup for the duration of a hand.
     """
 
     def __init__(self):
@@ -409,6 +410,8 @@ class HandTracker:
         self.preflop_action = None   # type: Optional[PreflopAction]
         self._positions = None       # type: Optional[Dict]
         self._preflop_seen = False
+        self._locked_dealer = None   # type: Optional[int]
+        self._locked_solver = None   # type: Optional[Dict]
 
     def update(self, game_state):
         # type: (...) -> None
@@ -420,8 +423,15 @@ class HandTracker:
             self._reset()
             self.current_hand_id = hand_id
 
-        # Cache positions
-        if self._positions is None or game_state.dealer_seat:
+        # Lock dealer seat from the first valid read
+        if self._locked_dealer is None and game_state.dealer_seat:
+            self._locked_dealer = game_state.dealer_seat
+        # Override game state dealer with locked value
+        if self._locked_dealer is not None:
+            game_state.dealer_seat = self._locked_dealer
+
+        # Cache positions (uses locked dealer)
+        if self._positions is None:
             self._positions = game_state.infer_positions()
 
         # Capture preflop action when we're on preflop
@@ -436,12 +446,35 @@ class HandTracker:
 
     def get_solver_inputs(self, game_state, range_lookup):
         # type: (...) -> Optional[Dict]
-        """Get solver inputs using tracked state."""
+        """Get solver inputs using tracked state.
+
+        Locks the IP/OOP matchup and ranges on first computation so that
+        villain selection doesn't flip mid-hand (e.g. when a player shoves
+        and their stack drops to 0). Pot and effective stack update each frame.
+        """
         self.update(game_state)
-        return determine_solver_inputs(game_state, range_lookup, hand_tracker=self)
+        result = determine_solver_inputs(game_state, range_lookup, hand_tracker=self)
+        if result is None:
+            # If fresh computation failed, return locked result with updated pot
+            if self._locked_solver is not None:
+                return self._locked_solver
+            return None
+        if self._locked_solver is None:
+            # First successful computation — lock matchup and ranges
+            self._locked_solver = result
+        else:
+            # Keep locked matchup/ranges, update dynamic fields
+            result["oop_range"] = self._locked_solver["oop_range"]
+            result["ip_range"] = self._locked_solver["ip_range"]
+            result["oop_position"] = self._locked_solver["oop_position"]
+            result["ip_position"] = self._locked_solver["ip_position"]
+            result["hero_position"] = self._locked_solver["hero_position"]
+        return result
 
     def _reset(self):
         self.current_hand_id = None
         self.preflop_action = None
         self._positions = None
         self._preflop_seen = False
+        self._locked_dealer = None
+        self._locked_solver = None

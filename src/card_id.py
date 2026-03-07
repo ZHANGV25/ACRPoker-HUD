@@ -348,9 +348,12 @@ def _suit_from_rank_color(rank_roi: np.ndarray,
     black = int(np.sum((v < 120) & (s < 80) & text_px))
 
     threshold = max(total * 0.15, 5)
-    if green > threshold and green > blue and green > black:
+    # Green/blue must dominate clearly — if black is also significant,
+    # the green may be from an overlapping action label (e.g. "C/C/C"),
+    # not the actual rank text.
+    if green > threshold and green > blue and green > black * 3:
         return 'c'
-    if blue > threshold and blue > green and blue > black:
+    if blue > threshold and blue > green and blue > black * 3:
         return 'd'
     if four_color:
         if red > threshold and red > black:
@@ -422,7 +425,7 @@ def _detect_suit(card_img: np.ndarray) -> str:
     if fc is not None:
         return fc
 
-    # Color detection (2-color fallback)
+    # Color detection
     hsv = cv2.cvtColor(suit_roi, cv2.COLOR_BGR2HSV)
     red1 = cv2.inRange(hsv, np.array([0, 80, 80]), np.array([10, 255, 255]))
     red2 = cv2.inRange(hsv, np.array([170, 80, 80]), np.array([180, 255, 255]))
@@ -481,7 +484,7 @@ def _detect_suit(card_img: np.ndarray) -> str:
 
         # 2. Waist-to-lower width ratio: clubs have a narrow waist (25-45%)
         #    then dramatic widening (50-65%) due to three lobes + stem.
-        #    Spades widen monotonically. Ratio >1.8 = clubs.
+        #    Spades widen monotonically. Ratio >2.0 = clubs.
         waist_widths = []
         lower_widths = []
         for pct in [0.25, 0.30, 0.35, 0.40, 0.45]:
@@ -497,10 +500,26 @@ def _detect_suit(card_img: np.ndarray) -> str:
         if waist_widths and lower_widths:
             min_waist = min(waist_widths)
             max_lower = max(lower_widths)
-            if min_waist > 0 and max_lower / min_waist > 1.8:
+            if min_waist > 0 and max_lower / min_waist > 2.0:
                 return 'c'
 
         return 's'
+
+
+def _pip_roi(card_img: np.ndarray, search_right: bool = False) -> np.ndarray:
+    """Extract the below-rank pip area from a card image."""
+    ch, cw = card_img.shape[:2]
+    face_x, face_y = _find_face_start(card_img, search_right=search_right)
+    face_w = cw - face_x
+    face_h = ch - face_y
+    py1 = face_y + max(int(face_h * 0.25), 3)
+    py2 = face_y + min(int(face_h * 0.45), ch)
+    px1 = face_x
+    px2 = face_x + max(int(face_w * 0.35), 5)
+    roi = card_img[py1:py2, px1:px2]
+    if roi.size == 0:
+        return card_img[0:1, 0:1]  # tiny fallback
+    return roi
 
 
 def _detect_suit_hero(card_img: np.ndarray) -> str:
@@ -739,6 +758,14 @@ def _identify_card_right(card_img: np.ndarray,
     if score < 0.65:
         return None
 
+    # Reject suspiciously narrow characters — likely a partial read from
+    # card overlap. Even J (narrowest rank) is 15px at 40px height.
+    char_bin = (char_norm > 127).astype(np.float32)
+    char_cols = (char_bin > 0.5).any(axis=0)
+    char_ink_w = int(char_cols.sum())
+    if char_ink_w < 14:
+        return None
+
     # Check for "10" (T)
     if rank in ('9', '6', 'Q', 'T') and score < 0.90:
         if _has_one_digit_left(rank_roi, char_norm):
@@ -950,19 +977,20 @@ def detect_and_identify_hero(hero_img: np.ndarray) -> List[Optional[str]]:
     c1 = hero_img[y:y + h, x:x + split]
     c2 = hero_img[y:y + h, x + split:x + w]
 
-    # Detect 4-color mode: if either card's rank text is green or blue,
-    # then red=hearts and black=spades unambiguously.
+    # Always 4-color deck — rank text color determines suit:
+    # green=clubs, blue=diamonds, red=hearts, black=spades.
+    # Pip-based detection is unreliable for hero cards because ACR overlays
+    # green action labels on the card area, contaminating pip regions.
     c1_rank_roi = _rank_area(c1)
-    c1_color = _suit_from_rank_color(c1_rank_roi)
+    c1_color = _suit_from_rank_color(c1_rank_roi, four_color=True)
 
-    # Also check card 2 for green/blue (card 1 might be red/black)
     face_x2, face_y2 = _find_face_start(c2, search_right=True)
     ch2, cw2 = c2.shape[:2]
     fw2, fh2 = cw2 - face_x2, ch2 - face_y2
     c2_rank_roi = c2[face_y2:face_y2 + max(int(fh2 * 0.30), 5),
                      face_x2:face_x2 + max(int(fw2 * 0.50), 5)]
-    c2_color = _suit_from_rank_color(c2_rank_roi)
-    is_4color = (c1_color in ('c', 'd')) or (c2_color in ('c', 'd'))
+    c2_color = _suit_from_rank_color(c2_rank_roi, four_color=True)
+    is_4color = True
 
     cards = []
 
@@ -1022,8 +1050,8 @@ def detect_dealer_button(img: np.ndarray) -> Optional[int]:
     search = img[sy1:sy2, sx1:sx2]
     gray = cv2.cvtColor(search, cv2.COLOR_BGR2GRAY)
 
-    # Step 1: Threshold for bright pixels (button face is white)
-    _, bright = cv2.threshold(gray, 190, 255, cv2.THRESH_BINARY)
+    # Step 1: Threshold for bright pixels (button face is white/light gray)
+    _, bright = cv2.threshold(gray, 175, 255, cv2.THRESH_BINARY)
 
     # Step 2: Morphological close to bridge the dark "D" letter inside the button
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
@@ -1064,7 +1092,7 @@ def detect_dealer_button(img: np.ndarray) -> Optional[int]:
                 'circularity': circularity,
             })
 
-    # Step 4: Verify each candidate has the "D" letter pattern
+    # Step 4: Verify each candidate has the "D" letter pattern + color neutrality
     verified = []
     for cd in candidates:
         margin = 3
@@ -1073,22 +1101,33 @@ def detect_dealer_button(img: np.ndarray) -> Optional[int]:
         rx2 = min(iw, cd['abs_x'] + cd['w'] + margin)
         ry2 = min(ih, cd['abs_y'] + cd['h'] + margin)
 
-        roi_gray = cv2.cvtColor(img[ry1:ry2, rx1:rx2], cv2.COLOR_BGR2GRAY)
-        if roi_gray.size == 0:
+        roi = img[ry1:ry2, rx1:rx2]
+        if roi.size == 0:
             continue
+        roi_gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
 
         bright_pct = np.sum(roi_gray > 180) / roi_gray.size
         dark_pct = np.sum(roi_gray < 120) / roi_gray.size
 
-        # The button face should be mostly bright with some dark text
-        if bright_pct > 0.30 and 0.05 < dark_pct < 0.50:
+        # Color neutrality: real D button is gray/white, action circles are colored
+        mean_b = float(roi[:, :, 0].mean())
+        mean_g = float(roi[:, :, 1].mean())
+        mean_r = float(roi[:, :, 2].mean())
+        mean_all = (mean_b + mean_g + mean_r) / 3.0
+        color_dev = max(abs(mean_b - mean_all), abs(mean_g - mean_all),
+                        abs(mean_r - mean_all))
+
+        # The button face should be mostly bright with some dark text,
+        # and color-neutral (not green/red/blue action circles)
+        if bright_pct > 0.30 and 0.05 < dark_pct < 0.55 and color_dev < 20:
+            cd['color_dev'] = color_dev
             verified.append(cd)
 
     if not verified:
         return None
 
-    # Step 5: Pick the best candidate (highest circularity, then largest area)
-    best = max(verified, key=lambda c: (c['circularity'], c['area']))
+    # Step 5: Pick the best candidate — prefer most color-neutral, then circularity
+    best = max(verified, key=lambda c: (-c['color_dev'], c['circularity'], c['area']))
 
     # Step 6: Map button center to nearest seat
     btn_cx = (best['abs_x'] + best['w'] / 2) / iw
