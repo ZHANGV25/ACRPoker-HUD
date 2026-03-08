@@ -6,7 +6,7 @@ import os
 import random
 import time
 import threading
-from typing import Tuple
+from typing import Optional, Tuple
 
 sys.path.insert(0, os.path.dirname(__file__))
 
@@ -20,12 +20,16 @@ from AppKit import (
     NSFloatingWindowLevel,
 )
 from Foundation import NSMutableAttributedString, NSRange
-from AppKit import NSForegroundColorAttributeName, NSFontAttributeName
+from AppKit import (
+    NSForegroundColorAttributeName, NSFontAttributeName,
+    NSEvent, NSKeyDownMask,
+)
 import numpy as np
 
 from src.capture import find_target_windows, capture_window
 from src.pipeline import process_screenshot
 from src.watch import ReadingSmoother, EngineRunner, ENGINE_BIN, MIN_WINDOW_WIDTH
+from src.clicker import Clicker
 from solver.range_lookup import RangeLookup, preflop_advice
 from solver.action_history import HandTracker
 from solver.hh_watcher import HHWatcher
@@ -191,7 +195,8 @@ def _bar_str(pct, width=15):
 
 
 def process_frame(img, tracker, smoother, engine, rl, name_cache,
-                  hh_watcher, action_picker, table_name=""):
+                  hh_watcher, action_picker, table_name="",
+                  clicker=None, win_bounds=None):
     # type: (...) -> Tuple[StyledText, bool]
     """Process one frame and return (styled_text, hero_has_action)."""
     t0 = time.time()
@@ -314,15 +319,25 @@ def process_frame(img, tracker, smoother, engine, rl, name_cache,
     # ─── Main action area ───
     st.nl()
 
+    # Reset clicker tracking on new hand
+    if clicker:
+        clicker.reset_for_new_hand(gs.hand_id)
+
     if gs.street == "preflop" and hero_has_action:
-        _render_preflop(st, gs, positions, rl, hh_watcher)
+        advice = _render_preflop(st, gs, positions, rl, hh_watcher)
+        if clicker and win_bounds and advice:
+            clicker.execute_preflop(advice, win_bounds, gs)
     elif result and hero_has_action:
-        _render_postflop(st, result, engine, action_picker)
+        picked = _render_postflop(st, result, engine, action_picker)
+        if clicker and win_bounds and picked:
+            clicker.execute_postflop(picked, win_bounds, gs)
     elif status == "running":
         st.add("      ", FONT_ACTION, CLR_DIM)
         st.line("...", FONT_ACTION, CLR_DIM)
     elif gs.street == "flop" and hero_has_action:
-        st.line("  (flop -- no live solve)", FONT_BODY, CLR_DIM)
+        picked = _render_flop_heuristic(st, gs)
+        if clicker and win_bounds and picked:
+            clicker.execute_postflop(picked, win_bounds, gs)
     elif not hero_has_action:
         st.line("  Waiting for action...", FONT_BODY, CLR_DIM)
     elif status == "error":
@@ -392,9 +407,14 @@ def process_frame(img, tracker, smoother, engine, rl, name_cache,
     if hh_watcher:
         debug_parts.append("hh:{}".format(hh_watcher.total_hands))
     debug_parts.append("ocr:{}".format("ON" if hero_ocr_on else "OFF"))
+    if clicker:
+        auto_str = "ON" if clicker.enabled else "OFF"
+        debug_parts.append("auto:{}".format(auto_str))
     st.add("  {}".format(" | ".join(debug_parts)), FONT_SMALL, CLR_DIM)
     st.nl()
     st.add("  raw:{} lock:{}".format(raw_h, locked_h), FONT_SMALL, CLR_DIM)
+    if clicker and clicker.last_action:
+        st.add("  click:{}".format(clicker.last_action), FONT_SMALL, CLR_GREEN)
     if solver_err:
         st.nl()
         st.add("  {}".format(solver_err[:50]), FONT_SMALL, CLR_RED)
@@ -430,8 +450,8 @@ def process_frame(img, tracker, smoother, engine, rl, name_cache,
 
 
 def _render_preflop(st, gs, positions, rl, hh_watcher):
-    # type: (StyledText, ..., dict, RangeLookup, ...) -> None
-    """Render preflop advice in the action area."""
+    # type: (StyledText, ..., dict, RangeLookup, ...) -> Optional[str]
+    """Render preflop advice in the action area. Returns advice string for clicker."""
     hero_pos_name = None
     for p in gs.players:
         if p.is_hero and p.seat in positions:
@@ -466,7 +486,7 @@ def _render_preflop(st, gs, positions, rl, hh_watcher):
 
     if not advice:
         st.line("  (waiting for preflop data)", FONT_BODY, CLR_DIM)
-        return
+        return None
 
     # Parse the action word from advice (e.g. "RAISE  AKs in CO's open range")
     action_word = advice.split()[0] if advice else ""
@@ -491,14 +511,109 @@ def _render_preflop(st, gs, positions, rl, hh_watcher):
             st.add("  {}".format(tip), FONT_BODY, CLR_EXPLOIT)
         st.nl()
 
+    return advice
+
+
+# ─── Flop Heuristic (placeholder until solver covers flop) ──────────────────
+
+# Hand strength keywords from ACR's display, ranked roughly by strength.
+# ACR shows: "X high", "Pair of X", "Two pair", "Three of a kind",
+# "Straight", "Flush", "Full house", "Four of a kind", "Straight flush"
+_MADE_HAND_KEYWORDS = [
+    "straight flush", "four of a kind", "full house", "flush",
+    "straight", "three of a kind", "trips", "two pair", "pair",
+]
+
+
+def _flop_heuristic(gs):
+    # type: (...) -> Optional[dict]
+    """Simple flop heuristic based on ACR's hand strength text.
+
+    Returns a fake picked-action dict like {"action": "Check", "frequency": 1.0}
+    or None if we can't determine anything.
+
+    Logic:
+      - Strong (two pair+, or pair with top pair likely): bet 66%
+      - Medium (any pair): check/call
+      - Nothing (high card): check if possible, fold if facing bet
+    """
+    aa = gs.available_actions or {}
+    hs = (aa.get("hand_strength") or "").lower()
+    has_check = aa.get("check")
+    has_call = aa.get("call") is not None
+    facing_bet = has_call and not has_check  # must call or fold
+
+    # Determine hand category
+    is_strong = False
+    is_medium = False
+    for kw in _MADE_HAND_KEYWORDS:
+        if kw in hs:
+            if kw in ("two pair", "three of a kind", "trips",
+                       "straight", "flush", "full house",
+                       "four of a kind", "straight flush"):
+                is_strong = True
+            else:
+                is_medium = True  # pair
+            break
+
+    if is_strong:
+        # Bet or raise
+        if aa.get("raise_to") is not None or aa.get("bet") is not None:
+            return {"action": "Bet 66% (0)", "frequency": 1.0}
+        elif has_call:
+            return {"action": "Call", "frequency": 1.0}
+        else:
+            return {"action": "Check", "frequency": 1.0}
+    elif is_medium:
+        # Pair — check if possible, call if facing bet
+        if has_check:
+            return {"action": "Check", "frequency": 1.0}
+        elif has_call:
+            return {"action": "Call", "frequency": 1.0}
+        else:
+            return {"action": "Check", "frequency": 1.0}
+    else:
+        # Nothing — check if possible, fold if facing bet
+        if has_check:
+            return {"action": "Check", "frequency": 1.0}
+        elif facing_bet:
+            return {"action": "Fold", "frequency": 1.0}
+        else:
+            return {"action": "Check", "frequency": 1.0}
+
+
+def _render_flop_heuristic(st, gs):
+    # type: (StyledText, ...) -> Optional[dict]
+    """Render flop heuristic action. Returns picked action dict for clicker."""
+    picked = _flop_heuristic(gs)
+    if not picked:
+        st.line("  (flop -- no data)", FONT_BODY, CLR_DIM)
+        return None
+
+    action_name = picked["action"]
+    color = _action_color(action_name)
+    display_name = action_name.split()[0].upper()
+
+    st.add("       ", FONT_ACTION)
+    st.line(display_name, FONT_ACTION, color)
+
+    hs = (gs.available_actions or {}).get("hand_strength", "")
+    st.add("  flop heuristic", FONT_BODY, CLR_DIM)
+    if hs:
+        st.add("  ({})\n".format(hs), FONT_SMALL, CLR_DIM)
+    else:
+        st.nl()
+
+    return picked
+
 
 def _render_postflop(st, result, engine, action_picker):
-    # type: (StyledText, dict, EngineRunner, ActionPicker) -> None
-    """Render postflop solver result with RNG-picked action."""
+    # type: (StyledText, dict, EngineRunner, ActionPicker) -> Optional[dict]
+    """Render postflop solver result with RNG-picked action. Returns picked action dict."""
     picked = action_picker.pick(result)
     if not picked:
         st.line("  (no action)", FONT_BODY, CLR_DIM)
-        return
+        return None
 
     action_name = picked["action"]
     color = _action_color(action_name)
@@ -536,6 +651,8 @@ def _render_postflop(st, result, engine, action_picker):
         st.add("{}".format(a["action"]), FONT_SMALL, CLR_TEXT if is_picked else CLR_DIM)
         st.nl()
 
+    return picked
+
 
 def _archetype_color(archetype):
     # type: (str) -> ...
@@ -565,29 +682,30 @@ def _extract_table_name(title):
 
 
 def _capture_settled():
-    """Find table and capture settled frame. Returns (img, title, table_name)."""
+    """Find table and capture settled frame. Returns (img, title, table_name, bounds)."""
     try:
         windows = find_target_windows()
     except RuntimeError:
-        return None, "", ""
+        return None, "", "", None
     expanded = [w for w in windows if w["bounds"]["w"] >= MIN_WINDOW_WIDTH]
     if not expanded:
-        return None, "", ""
+        return None, "", "", None
     win = expanded[0]
     title = "{} ({}x{})".format(win["title"][:40], win["bounds"]["w"], win["bounds"]["h"])
     table_name = _extract_table_name(win["title"])
+    bounds = win["bounds"]
 
     img1 = capture_window(win["id"])
     if img1 is None:
-        return None, title, table_name
+        return None, title, table_name, bounds
     time.sleep(0.25)
     img2 = capture_window(win["id"])
     if img2 is None or img1.shape != img2.shape:
-        return None, title, table_name
+        return None, title, table_name, bounds
     diff = np.mean(np.abs(img1.astype(float) - img2.astype(float)))
     if diff > 3.0:
-        return None, title, table_name
-    return img2, title, table_name
+        return None, title, table_name, bounds
+    return img2, title, table_name, bounds
 
 
 # ─── App Delegate ─────────────────────────────────────────────────────────────
@@ -627,6 +745,11 @@ class OverlayDelegate(AppKit.NSObject):
         self.hh_watcher = HHWatcher()
         self.hh_watcher.start()
         self.action_picker = ActionPicker()
+        auto_click = getattr(self, '_auto_click', False)
+        self.clicker = Clicker(enabled=auto_click)
+        if auto_click:
+            self.window.setTitle_("Poker HUD [AUTO]")
+            sys.stderr.write("[clicker] Auto-click enabled via --auto\n")
         self.last_text_hash = None
 
         # Queue for styled text from worker thread
@@ -637,6 +760,24 @@ class OverlayDelegate(AppKit.NSObject):
         t.start()
 
         self._start_timer()
+        self._setup_hotkey()
+
+    @objc.python_method
+    def _setup_hotkey(self):
+        """Register global hotkey (F2) to toggle auto-click."""
+        def handler(event):
+            # F2 key = keyCode 120
+            if event.keyCode() == 120:
+                new_state = self.clicker.toggle()
+                title = "Poker HUD [AUTO]" if new_state else "Poker HUD"
+                # Schedule UI update on main thread
+                self.window.setTitle_(title)
+                sys.stderr.write("[clicker] Auto-click {}\n".format(
+                    "ON" if new_state else "OFF"))
+        NSEvent.addGlobalMonitorForEventsMatchingMask_handler_(
+            NSKeyDownMask, handler)
+        NSEvent.addLocalMonitorForEventsMatchingMask_handler_(
+            NSKeyDownMask, lambda event: (handler(event), event)[1])
 
     def _start_timer(self):
         AppKit.NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
@@ -648,7 +789,7 @@ class OverlayDelegate(AppKit.NSObject):
         last_had_action = False
         while True:
             try:
-                img, title, table_name = _capture_settled()
+                img, title, table_name, bounds = _capture_settled()
                 if img is None:
                     st = StyledText()
                     st.nl()
@@ -662,7 +803,8 @@ class OverlayDelegate(AppKit.NSObject):
                     st, had_action = process_frame(
                         img, self.tracker, self.smoother, self.engine,
                         self.rl, name_cache, self.hh_watcher, self.action_picker,
-                        table_name=table_name)
+                        table_name=table_name,
+                        clicker=self.clicker, win_bounds=bounds)
 
                 with self._queue_lock:
                     self._queue.append(st)
@@ -691,8 +833,15 @@ class OverlayDelegate(AppKit.NSObject):
 
 
 def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="Poker HUD overlay")
+    parser.add_argument("--auto", action="store_true",
+                        help="Enable auto-clicker on startup")
+    args = parser.parse_args()
+
     app = NSApplication.sharedApplication()
     delegate = OverlayDelegate.alloc().init()
+    delegate._auto_click = args.auto
     app.setDelegate_(delegate)
     app.setActivationPolicy_(AppKit.NSApplicationActivationPolicyAccessory)
     app.activateIgnoringOtherApps_(True)
