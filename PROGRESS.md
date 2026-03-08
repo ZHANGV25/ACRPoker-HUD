@@ -195,6 +195,22 @@ the right long-term fix. The core logic is cross-platform; only I/O layers need 
 - At runtime, look up the flop solution instantly instead of solving live
 - This gives full flop+turn+river GTO coverage
 
+### 4. True multi-table support (multiple big tables)
+On PC with a large monitor, multiple tables can be full-size simultaneously (no
+auto-stack). The current architecture already supports this (separate `TableState`
+per window, independent smoother/tracker/solver per table), but needs adjustments:
+
+- **Remove "frontmost only" assumption** — process all tables that have action,
+  not just the topmost window
+- **Parallel solver instances** — currently solver runs sequentially per table.
+  With 2+ tables needing action simultaneously, need thread-per-table solver
+  execution to avoid delayed responses on the second table
+- **Clicker coordination** — clicking already uses per-window bounds and
+  duplicate-click guards, so multiple tables clicking independently should work
+- **Priority queue** — optionally prioritize tables with lower time bank remaining
+- **Resource management** — solver is CPU-intensive; may need to limit concurrent
+  solver instances to avoid system overload (e.g., max 2-3 parallel solves)
+
 ## File Structure
 ```
 poker/
