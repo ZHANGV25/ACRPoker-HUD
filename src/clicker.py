@@ -332,7 +332,13 @@ class Clicker:
                      available_actions.get("bet") is not None)
         has_fold = available_actions.get("fold")
 
-        if action_type == "check" and not has_check:
+        if action_type == "fold" and not has_fold:
+            # No fold button (e.g. BB with no raise — only Check + Bet shown)
+            if has_check:
+                return "check"
+            elif has_call:
+                return "call"
+        elif action_type == "check" and not has_check:
             # No check button — click call instead (facing all-in)
             if has_call or has_raise:
                 return "call"
@@ -352,10 +358,23 @@ class Clicker:
         # type: (str, Optional[float], dict, Optional[dict]) -> bool
         """Perform the actual click(s) for an action type."""
         aa = available_actions or {}
+
+        # Safety: don't click on minimized/tiny windows (ACR minimizes
+        # tables when hero is not in action). Normal table is ~900x700+.
+        if bounds.get("w", 0) < 350 or bounds.get("h", 0) < 250:
+            sys.stderr.write("[clicker] Window too small ({}x{}), skipping\n".format(
+                bounds.get("w", 0), bounds.get("h", 0)))
+            return False
+
         # Human-like reaction delay (varies widely)
         time.sleep(random.uniform(REACTION_MIN, REACTION_MAX))
 
         if action_type == "fold":
+            # Only click fold if the fold button actually exists on screen.
+            # ACR sometimes shows only Check + Bet (no fold) in BB with no raise.
+            if not aa.get("fold"):
+                sys.stderr.write("[clicker] No fold button, skipping\n")
+                return False
             _click_region(FOLD_BUTTON, bounds)
             return True
 

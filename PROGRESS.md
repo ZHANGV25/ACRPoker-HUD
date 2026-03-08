@@ -113,6 +113,14 @@ Parse ACR hand history files for accurate player stat tracking.
 - OCR occasionally misreads decimals (e.g. "0.5" -> "5.0")
 - Board card turn/river order occasionally swaps (rare)
 
+## TODO
+- **Fix card OCR reliability** — still makes costly misreads in live play:
+  - 8 misread as Q (round shape confusion with Q template)
+  - 6 misread as 8 or 5
+  - 10 misread as 8 or J (the "0" in "10" matches 8 template)
+  - Card 2 misreads (T→8, 8→T) via `_identify_card_right` path
+  - Root cause: template matching IoU scoring isn't discriminative enough; Q is a "catch-all" for round shapes. Consider CNN-based or feature-based approach for more reliable rank classification at small card sizes (~467px wide tables).
+
 ## File Structure
 ```
 poker/

@@ -159,8 +159,31 @@ def _extract_char_from_roi(roi: np.ndarray) -> Optional[np.ndarray]:
     if not contours:
         return None
 
-    largest = max(contours, key=cv2.contourArea)
-    x, y, w, h = cv2.boundingRect(largest)
+    # Filter to contours that could be a rank character:
+    # - minimum area to skip noise
+    # - minimum width/height to skip thin edge strips (card borders)
+    roi_h = text_mask.shape[0]
+    valid = []
+    for c in contours:
+        area = cv2.contourArea(c)
+        if area < 30:
+            continue
+        bx, by, bw, bh = cv2.boundingRect(c)
+        if bw < 8 or bh < 12:
+            continue
+        valid.append(((bx, by, bw, bh), area))
+    if not valid:
+        return None
+
+    # Among contours in the TOP 60% of the ROI, pick the largest.
+    # This avoids selecting the suit pip (bottom of ROI) while still
+    # preferring the main rank character over the "1" in "10".
+    top_cutoff = roi_h * 0.6
+    top_valid = [v for v in valid if v[0][1] < top_cutoff]
+    if not top_valid:
+        top_valid = valid  # fallback to all if none in top region
+    top_valid.sort(key=lambda v: v[1], reverse=True)  # sort by area descending
+    (x, y, w, h), area = top_valid[0]
     if h < 5 or w < 3:
         return None
 
@@ -242,8 +265,9 @@ def _read_rank(card_img: np.ndarray) -> Optional[str]:
 
     # Check for "10" (T): the "0" digit may match as 9/6/8/Q.
     # Always check Q — the "0" in "10" often scores high as Q.
+    # For 8: only when score is ambiguous (real 8 scores >0.80, "0" scores ~0.60).
     # For other similar shapes, only check when score is ambiguous.
-    if rank == 'Q' or (rank in ('9', '6', 'T') and score < 0.90):
+    if rank == 'Q' or (rank == '8' and score < 0.80) or (rank in ('9', '6', 'T') and score < 0.90):
         if _has_one_digit_left(rank_roi, char_norm):
             return 'T'
 
@@ -840,7 +864,7 @@ def _identify_card_right(card_img: np.ndarray,
         return None
 
     # Check for "10" (T)
-    if rank == 'Q' or (rank in ('9', '6', 'T') and score < 0.90):
+    if rank == 'Q' or (rank == '8' and score < 0.80) or (rank in ('9', '6', 'T') and score < 0.90):
         if _has_one_digit_left(rank_roi, char_norm):
             rank = 'T'
 
@@ -1075,6 +1099,45 @@ def detect_and_identify_hero(hero_img: np.ndarray) -> List[Optional[str]]:
 
     # Card 1: left portion (front card — top-right pip may be cut off)
     c1_rank = _read_rank(c1)
+
+    # Debug: save card intermediates to diagnose misreads.
+    import sys
+    import time as _time
+    _dbg_ts = str(int(_time.time() * 1000) % 1000000)
+    _dbg_dir = "/tmp/hero_card_debug"
+    os.makedirs(_dbg_dir, exist_ok=True)
+    # Cleanup old debug files (keep last 200 files)
+    _dbg_files = sorted(os.listdir(_dbg_dir))
+    if len(_dbg_files) > 200:
+        for _old in _dbg_files[:len(_dbg_files) - 200]:
+            try:
+                os.remove(os.path.join(_dbg_dir, _old))
+            except OSError:
+                pass
+    cv2.imwrite(f"{_dbg_dir}/{_dbg_ts}_hero_full.png", hero_img)
+    cv2.imwrite(f"{_dbg_dir}/{_dbg_ts}_c1_crop.png", c1)
+    _dbg_fx, _dbg_fy = _find_face_start(c1)
+    _dbg_c1h, _dbg_c1w = c1.shape[:2]
+    _dbg_rx1 = max(_dbg_fx - 3, 0)
+    _dbg_ry1 = _dbg_fy + 2
+    _dbg_rx2 = min(_dbg_rx1 + max(int(_dbg_c1w * 0.40), 50), _dbg_c1w)
+    _dbg_ry2 = min(_dbg_ry1 + max(int(_dbg_c1h * 0.30), 42), _dbg_c1h)
+    _dbg_roi = c1[_dbg_ry1:_dbg_ry2, _dbg_rx1:_dbg_rx2]
+    if _dbg_roi.size > 0:
+        cv2.imwrite(f"{_dbg_dir}/{_dbg_ts}_c1_rank_roi.png", _dbg_roi)
+        _dbg_char = _extract_char_from_roi(_dbg_roi)
+        if _dbg_char is not None:
+            cv2.imwrite(f"{_dbg_dir}/{_dbg_ts}_c1_char_{c1_rank or 'None'}.png", _dbg_char)
+            _dbg_rk, _dbg_sc = _match_rank(_dbg_char)
+            # Get top 5 scores for logging
+            _dbg_tmpls = _load_templates()
+            _dbg_scores = sorted(
+                [(r, _match_rank_single(_dbg_char, r)) for r in _dbg_tmpls],
+                key=lambda x: x[1], reverse=True)[:5]
+            _dbg_top = " ".join(f"{r}={s:.3f}" for r, s in _dbg_scores)
+            sys.stderr.write(f"[card1-dbg] rank={c1_rank} face=({_dbg_fx},{_dbg_fy}) "
+                             f"char={_dbg_char.shape[1]}x{_dbg_char.shape[0]} [{_dbg_top}]\n")
+
     if c1_rank is not None:
         c1_suit = c1_color  # Already computed above
         if c1_suit is None:
@@ -1088,10 +1151,16 @@ def detect_and_identify_hero(hero_img: np.ndarray) -> List[Optional[str]]:
     # Card 2: right portion — overlapped by card 1 on the left
     # Try with search_right=True since card 1 bleeds into the left of c2
     c2_result = _identify_card_right(c2, four_color=is_4color)
+    _c2_method = "right"
     if c2_result is None:
         # Skip normal identify_card — it picks up card 1's content on the left
         c2_result = _identify_hero_card2(hero_img, x, y, w, h, split)
+        _c2_method = "fallback"
     cards.append(c2_result)
+
+    # Debug card 2
+    cv2.imwrite(f"{_dbg_dir}/{_dbg_ts}_c2_crop.png", c2)
+    sys.stderr.write(f"[card2-dbg] result={c2_result} method={_c2_method}\n")
 
     return cards
 
@@ -1263,6 +1332,7 @@ def _identify_hero_card2(hero_img: np.ndarray, x: int, y: int,
     # Try all candidates and pick the one with the best match score
     best_result = None
     best_score = 0.0
+    best_bbox = None
 
     for cx, cy, cw, ch_c, area in rank_candidates:
         char_img = mask[cy:cy + ch_c, cx:cx + cw]
@@ -1276,6 +1346,20 @@ def _identify_hero_card2(hero_img: np.ndarray, x: int, y: int,
         if score > best_score and score > 0.5:
             best_score = score
             best_result = rank
+            best_bbox = (cx, cy, cw, ch_c)
+
+    # Check for "10" (T): if best match is Q/8/9 (round shapes like "0"),
+    # look for a narrow "1" contour to its left among other candidates.
+    if best_result in ('Q', '8', '9') and best_bbox is not None:
+        bx, by, bw, bh = best_bbox
+        for cx, cy, cw, ch_c, area in rank_candidates:
+            if (cx, cy, cw, ch_c) == best_bbox:
+                continue
+            # Narrow contour to the left, vertically aligned
+            if (cw < ch_c * 0.5 and cx + cw <= bx and
+                    ch_c > bh * 0.5 and abs(cy - by) < bh * 0.3):
+                best_result = 'T'
+                break
 
     if best_result is not None:
         c2_full = hero_img[y:y + h, x + split:x + w]

@@ -30,7 +30,7 @@ from solver.range_lookup import RangeLookup
 from solver.action_history import HandTracker, reconstruct_preflop, determine_solver_inputs
 
 POLL_INTERVAL = 0.8
-MIN_WINDOW_WIDTH = 450  # Skip lobby/minimized windows, allow small table views
+MIN_WINDOW_WIDTH = 400  # Skip lobby/minimized windows; small tables can be ~467px
 SMOOTH_WINDOW = 5       # Number of recent reads to vote on for stabilization
 
 # Path to engine binary (built with cargo build --release)
@@ -79,16 +79,9 @@ class ReadingSmoother:
             self._current_hand_id = gs.hand_id
             self._current_board_len = 0
 
-            # Only reset hero locks if the card RANKS clearly changed
-            # (hand_id can flicker from OCR while hero still has same cards)
-            if self._hero_locked and gs.hero_cards:
-                new_ranks = sorted(c[0] for c in gs.hero_cards if c and len(c) >= 1)
-                old_ranks = sorted(c[0] for c in self._hero_locked.values() if c and len(c) >= 1)
-                if new_ranks != old_ranks:
-                    self._hero_history.clear()
-                    self._hero_locked.clear()
-            elif not self._hero_locked:
-                self._hero_history.clear()
+            # Always clear hero state on hand change to prevent stale locks
+            self._hero_history.clear()
+            self._hero_locked.clear()
 
         # Reset board locks when new cards appear (street change)
         board_len = len(gs.board) if gs.board else 0
@@ -144,9 +137,18 @@ class ReadingSmoother:
         """
         if threshold is None:
             threshold = self.LOCK_THRESHOLD
+        unlock_after = threshold + 1  # consecutive disagreements to override lock
         result = []
         for i in range(num_cards):
             if i in locked:
+                # Check if recent reads consistently disagree with lock
+                cards_at_pos = [h[i] for h in history if i < len(h) and h[i] is not None]
+                if len(cards_at_pos) >= unlock_after:
+                    recent = cards_at_pos[-unlock_after:]
+                    if (all(c == recent[0] for c in recent)
+                            and recent[0] != locked[i]):
+                        # Consistent new read overrides stale lock
+                        locked[i] = recent[0]
                 result.append(locked[i])
                 continue
 
