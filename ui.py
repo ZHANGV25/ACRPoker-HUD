@@ -18,10 +18,8 @@ from AppKit import (
     NSWindowStyleMaskResizable, NSWindowStyleMaskMiniaturizable,
     NSFloatingWindowLevel,
 )
-from Foundation import (
-    NSMutableAttributedString, NSRange,
-    NSForegroundColorAttributeName, NSFontAttributeName,
-)
+from Foundation import NSMutableAttributedString, NSRange
+from AppKit import NSForegroundColorAttributeName, NSFontAttributeName
 import numpy as np
 
 from src.capture import find_target_windows, capture_window
@@ -33,6 +31,8 @@ from solver.hh_watcher import HHWatcher
 from solver.exploitative import adjust_advice, adjust_solver_ranges
 
 POLL_INTERVAL = 1.0
+HERO_NAME = "vortexted"
+HERO_SEAT = 5  # ACR always puts hero at seat 5
 
 # ─── Colors ───────────────────────────────────────────────────────────────────
 
@@ -165,7 +165,7 @@ def _bar_str(pct, width=15):
 
 
 def process_frame(img, tracker, smoother, engine, rl, name_cache,
-                  hh_watcher, action_picker):
+                  hh_watcher, action_picker, table_name=""):
     # type: (...) -> StyledText
     """Process one frame and return styled text for the overlay."""
     t0 = time.time()
@@ -183,13 +183,40 @@ def process_frame(img, tracker, smoother, engine, rl, name_cache,
 
     smoother.update(gs, hero_has_action=hero_has_action)
 
-    # Stabilize player names from big-view reads only
+    # Hero name is always known — hardcode it
+    for p in gs.players:
+        if p.seat == HERO_SEAT:
+            p.name = HERO_NAME
+            p.is_hero = True
+            name_cache[HERO_SEAT] = HERO_NAME
+
+    # Seed name cache from hand history seat mapping (ground truth from disk)
+    if hh_watcher and table_name and not name_cache.get("_hh_seeded"):
+        hh_names = hh_watcher.get_table_names(table_name)
+        if hh_names:
+            for seat, hh_name in hh_names.items():
+                if seat != HERO_SEAT:
+                    name_cache[seat] = hh_name
+            name_cache["_hh_seeded"] = True
+
+    # Stabilize opponent names: only update from big-view reads,
+    # and resolve through HH fuzzy matching for accuracy
     if hero_has_action:
         for p in gs.players:
+            if p.seat == HERO_SEAT:
+                continue
             if p.name and len(p.name) >= 3:
-                name_cache[p.seat] = p.name
+                # Resolve OCR name to known HH name
+                if hh_watcher:
+                    resolved = hh_watcher._resolve_name(p.name)
+                    if resolved:
+                        name_cache[p.seat] = resolved
+                    elif p.seat not in name_cache:
+                        name_cache[p.seat] = p.name
+                elif p.seat not in name_cache:
+                    name_cache[p.seat] = p.name
     for p in gs.players:
-        if p.seat in name_cache:
+        if p.seat in name_cache and not isinstance(name_cache.get(p.seat), bool):
             p.name = name_cache[p.seat]
 
     positions = gs.infer_positions()
@@ -488,29 +515,44 @@ def _archetype_color(archetype):
 
 # ─── Capture ──────────────────────────────────────────────────────────────────
 
+def _extract_table_name(title):
+    # type: (str) -> str
+    """Extract table name from ACR window title.
+
+    Title format: 'Heyburn - No Limit - $0.01 / $0.02 Hold'em ...'
+    Returns: 'Heyburn'
+    """
+    if not title:
+        return ""
+    # Table name is the first word before ' - '
+    parts = title.split(" - ", 1)
+    return parts[0].strip() if parts else ""
+
+
 def _capture_settled():
-    """Find table and capture settled frame."""
+    """Find table and capture settled frame. Returns (img, title, table_name)."""
     try:
         windows = find_target_windows()
     except RuntimeError:
-        return None, ""
+        return None, "", ""
     expanded = [w for w in windows if w["bounds"]["w"] >= MIN_WINDOW_WIDTH]
     if not expanded:
-        return None, ""
+        return None, "", ""
     win = expanded[0]
     title = "{} ({}x{})".format(win["title"][:40], win["bounds"]["w"], win["bounds"]["h"])
+    table_name = _extract_table_name(win["title"])
 
     img1 = capture_window(win["id"])
     if img1 is None:
-        return None, title
+        return None, title, table_name
     time.sleep(0.12)
     img2 = capture_window(win["id"])
     if img2 is None or img1.shape != img2.shape:
-        return None, title
+        return None, title, table_name
     diff = np.mean(np.abs(img1.astype(float) - img2.astype(float)))
     if diff > 5.0:
-        return None, title
-    return img2, title
+        return None, title, table_name
+    return img2, title, table_name
 
 
 # ─── App Delegate ─────────────────────────────────────────────────────────────
@@ -570,7 +612,7 @@ class OverlayDelegate(AppKit.NSObject):
         name_cache = {}
         while True:
             try:
-                img, title = _capture_settled()
+                img, title, table_name = _capture_settled()
                 if img is None:
                     st = StyledText()
                     st.nl()
@@ -580,7 +622,8 @@ class OverlayDelegate(AppKit.NSObject):
                 else:
                     st = process_frame(
                         img, self.tracker, self.smoother, self.engine,
-                        self.rl, name_cache, self.hh_watcher, self.action_picker)
+                        self.rl, name_cache, self.hh_watcher, self.action_picker,
+                        table_name=table_name)
 
                 with self._queue_lock:
                     self._queue.append(st)

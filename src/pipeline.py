@@ -59,8 +59,9 @@ def _infer_dealer_from_bets(state):
     # type: (GameState) -> int | None
     """Infer dealer seat from blind bets on preflop.
 
-    The 0.5 BB bet uniquely identifies the SB. Dealer is the seat before SB.
-    Only works preflop before blinds are consumed.
+    Strategy 1: 0.5 BB bet = SB, dealer is seat before.
+    Strategy 2: unique 1.0 BB bet = BB, dealer is 2 seats before.
+    Only works on preflop.
     """
     if state.street != "preflop":
         return None
@@ -70,21 +71,34 @@ def _infer_dealer_from_bets(state):
     if len(active_seats) < 2:
         return None
 
-    # Find the unique 0.5 BB bettor (SB)
+    # Strategy 1: Find the unique 0.5 BB bettor (SB)
     sb_candidates = [p for p in active
                      if p.current_bet_bb is not None
                      and 0.4 <= p.current_bet_bb <= 0.6]
-    if len(sb_candidates) != 1:
-        return None
+    if len(sb_candidates) == 1:
+        sb_seat = sb_candidates[0].seat
+        try:
+            sb_idx = active_seats.index(sb_seat)
+            dealer_idx = (sb_idx - 1) % len(active_seats)
+            return active_seats[dealer_idx]
+        except ValueError:
+            pass
 
-    sb_seat = sb_candidates[0].seat
-    try:
-        sb_idx = active_seats.index(sb_seat)
-    except ValueError:
-        return None
+    # Strategy 2: Find unique 1.0 BB bettor (BB) — works when SB already raised
+    bb_candidates = [p for p in active
+                     if p.current_bet_bb is not None
+                     and 0.9 <= p.current_bet_bb <= 1.1
+                     and not p.is_folded]
+    if len(bb_candidates) == 1:
+        bb_seat = bb_candidates[0].seat
+        try:
+            bb_idx = active_seats.index(bb_seat)
+            dealer_idx = (bb_idx - 2) % len(active_seats)
+            return active_seats[dealer_idx]
+        except ValueError:
+            pass
 
-    dealer_idx = (sb_idx - 1) % len(active_seats)
-    return active_seats[dealer_idx]
+    return None
 
 
 def process_screenshot(img: np.ndarray) -> GameState:

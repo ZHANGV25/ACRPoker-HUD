@@ -42,6 +42,7 @@ class HHWatcher:
         self._stats_cache = {}  # type: Dict[str, PlayerHUDStats]
         self._name_resolve_cache = {}  # type: Dict[str, Optional[str]]  # ocr_name -> hh_name
         self._known_names = set()  # type: set  # all player names from hand history
+        self._recent_tables = {}  # type: Dict[str, dict]  # table_name -> {seat: name} from last hand
         self._cache_dirty = True
         self._hands_imported = 0
 
@@ -112,9 +113,13 @@ class HHWatcher:
         hands = _parse_content(content)
         count = 0
         for h in hands:
-            # Collect known player names
-            for _, (name, _) in h.seats.items():
+            # Collect known player names and table seat mappings
+            for seat, (name, _) in h.seats.items():
                 self._known_names.add(name)
+            if h.table_name:
+                self._recent_tables[h.table_name] = {
+                    seat: name for seat, (name, _) in h.seats.items()
+                }
             if not self._db.has_hand(h.hand_id):
                 self._db.record_hand(h)
                 count += 1
@@ -146,8 +151,12 @@ class HHWatcher:
         hands = _parse_content(new_data)
         count = 0
         for h in hands:
-            for _, (name, _) in h.seats.items():
+            for seat, (name, _) in h.seats.items():
                 self._known_names.add(name)
+            if h.table_name:
+                self._recent_tables[h.table_name] = {
+                    seat: name for seat, (name, _) in h.seats.items()
+                }
             if not self._db.has_hand(h.hand_id):
                 self._db.record_hand(h)
                 count += 1
@@ -195,6 +204,15 @@ class HHWatcher:
             if name:
                 result[name] = self.get_player_stats(name)
         return result
+
+    def get_table_names(self, table_name):
+        # type: (str) -> Dict[int, str]
+        """Get seat->name mapping from the most recent hand on this table.
+
+        table_name: extracted from the ACR window title (e.g. "Heyburn").
+        Returns {seat_num: player_name} or empty dict.
+        """
+        return dict(self._recent_tables.get(table_name, {}))
 
     @property
     def total_hands(self):

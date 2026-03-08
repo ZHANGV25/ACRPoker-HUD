@@ -241,8 +241,9 @@ def _read_rank(card_img: np.ndarray) -> Optional[str]:
         return None
 
     # Check for "10" (T): the "0" digit may match as 9/6/8/Q.
-    # Only check for ranks whose shape resembles "0".
-    if rank in ('9', '6', 'Q', 'T') and score < 0.90:
+    # Always check Q — the "0" in "10" often scores high as Q.
+    # For other similar shapes, only check when score is ambiguous.
+    if rank == 'Q' or (rank in ('9', '6', 'T') and score < 0.90):
         if _has_one_digit_left(rank_roi, char_norm):
             return 'T'
 
@@ -800,7 +801,7 @@ def _identify_card_right(card_img: np.ndarray,
         return None
 
     # Check for "10" (T)
-    if rank in ('9', '6', 'Q', 'T') and score < 0.90:
+    if rank == 'Q' or (rank in ('9', '6', 'T') and score < 0.90):
         if _has_one_digit_left(rank_roi, char_norm):
             rank = 'T'
 
