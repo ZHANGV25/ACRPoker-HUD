@@ -24,10 +24,16 @@ import cv2
 from PIL import Image
 
 
+MIN_TABLE_WIDTH = 400
+MIN_TABLE_HEIGHT = 300
+
+
 def find_target_windows() -> List[Dict]:
     """Find all target application table windows.
 
-    Returns list of dicts with keys: id, title, bounds (x, y, w, h)
+    Filters out lobby, minimized, and non-enlarged windows at the source.
+    Returns list of dicts with keys: id, title, bounds (x, y, w, h).
+    Ordered front-to-back (z-order from CGWindowListCopyWindowInfo).
     """
     if not HAS_QUARTZ:
         raise RuntimeError("Quartz not available - macOS only")
@@ -44,6 +50,13 @@ def find_target_windows() -> List[Dict]:
         # Target window identification — require Hold in title to skip lobby
         if ("Hold" in title) and ("ACR" in owner or "Winning" in owner):
             bounds = window.get("kCGWindowBounds", {})
+            w = int(bounds.get("Width", 0))
+            h = int(bounds.get("Height", 0))
+
+            # Skip minimized/non-enlarged windows — don't capture or process them
+            if w < MIN_TABLE_WIDTH or h < MIN_TABLE_HEIGHT:
+                continue
+
             target_windows.append({
                 "id": window.get("kCGWindowNumber"),
                 "title": title,
@@ -51,8 +64,8 @@ def find_target_windows() -> List[Dict]:
                 "bounds": {
                     "x": int(bounds.get("X", 0)),
                     "y": int(bounds.get("Y", 0)),
-                    "w": int(bounds.get("Width", 0)),
-                    "h": int(bounds.get("Height", 0)),
+                    "w": w,
+                    "h": h,
                 },
             })
 

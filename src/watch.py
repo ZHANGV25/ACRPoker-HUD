@@ -664,8 +664,8 @@ def run_live(show_all=False):
             print("[monitor] Fatal: {}".format(exc), file=sys.stderr)
             return
 
-        # Filter to expanded windows only (skip tiled)
-        expanded = [w for w in windows if w["bounds"]["w"] >= MIN_WINDOW_WIDTH]
+        # find_target_windows() already filters out minimized/small windows
+        expanded = windows
 
         if not expanded:
             if tables:
