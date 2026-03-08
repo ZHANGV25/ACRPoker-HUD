@@ -113,13 +113,71 @@ Parse ACR hand history files for accurate player stat tracking.
 - OCR occasionally misreads decimals (e.g. "0.5" -> "5.0")
 - Board card turn/river order occasionally swaps (rare)
 
-## TODO
-- **Fix card OCR reliability** — still makes costly misreads in live play:
-  - 8 misread as Q (round shape confusion with Q template)
-  - 6 misread as 8 or 5
-  - 10 misread as 8 or J (the "0" in "10" matches 8 template)
-  - Card 2 misreads (T→8, 8→T) via `_identify_card_right` path
-  - Root cause: template matching IoU scoring isn't discriminative enough; Q is a "catch-all" for round shapes. Consider CNN-based or feature-based approach for more reliable rank classification at small card sizes (~467px wide tables).
+## TODO: Windows/PC Rewrite
+The Mac pipeline works end-to-end but card OCR is unreliable at small table sizes
+(~467px wide on Mac). Moving to a PC with a bigger monitor + cleaner card deck is
+the right long-term fix. The core logic is cross-platform; only I/O layers need rewriting.
+
+### Why rewrite
+- At 467px wide tables, rank characters are ~8-12px tall → template matching can't
+  reliably distinguish 8/Q/6/9/0 (round shapes all look similar at low resolution)
+- Prism deck: rank text IS the card art (huge letters filling the card face).
+  Corner crop gets a slice of the decorative letter mixed with suit graphics.
+- Daisy deck: has clean separate corner text, but requires recalibrating templates,
+  suit pip positions, and face detection. Thick dark card border merges with rank
+  text contours in HSV thresholding (tested, broke most ranks).
+- Bigger monitor = 2-3x more pixels per rank → template matching becomes trivial.
+
+### What carries over unchanged (~60-70% of code)
+- `src/card_id.py` — template matching, suit detection (needs new templates for new deck)
+- `src/game_state.py` — game state model
+- `src/pipeline.py` — orchestrator (minor capture API changes)
+- `src/regions.py` — ratio-based coordinates (resolution-independent)
+- `solver/action_history.py` — preflop action reconstruction
+- `solver/range_lookup.py` + `solver/ranges.json` — GTO range tables
+- `solver/hh_parser.py` — hand history parser
+- `solver/player_stats.py` — SQLite stat tracker + archetypes
+- `solver/exploitative.py` — exploitative range adjustments
+- `solver/solver-cli/` — Rust solver binary (cross-compile for Windows)
+
+### What needs rewriting for Windows
+
+| Layer | macOS (current) | Windows replacement |
+|-------|----------------|-------------------|
+| Capture | Quartz `CGWindowListCreateImage` | `win32gui` + `mss` or `d3dshot` |
+| OCR | macOS Vision `VNRecognizeTextRequest` | Tesseract, EasyOCR, or Windows OCR API |
+| Overlay UI | AppKit `NSWindow`/`NSTextField` | `tkinter`, `PyQt`, or `pygame` overlay |
+| Clicking | Quartz `CGEventCreateMouseEvent` | `pyautogui` or `win32api` |
+| Window find | `CGWindowListCopyWindowInfo` | `win32gui.EnumWindows` |
+
+### Lessons learned (for the rewrite)
+- **Use Daisy deck** on PC — separate corner rank text, clean font, no art interference.
+  Regenerate all 13 rank templates from Daisy at the larger resolution.
+- **Card border issue**: Daisy has a thick dark rounded border that merges with rank text
+  in HSV thresholding. Fix: aspect ratio filter (w/h > 0.85 = border-merged blob),
+  left-edge trimming fallback, max normalized width of 32px.
+- **ReadingSmoother lock persistence**: MUST clear hero locks on every hand_id change.
+  Previous bug: if hero_cards was None when hand_id changed, old locks survived into
+  the next hand. Also add unlock override (3 consecutive disagreeing reads).
+- **Clicker safety**: verify fold button exists before clicking fold. Skip clicks on
+  windows smaller than 350x250 (minimized/stacked). Remap fold→check when no fold button.
+- **Multi-table**: macOS can capture windows even when behind other windows.
+  `CGWindowListCopyWindowInfo(kCGWindowListOptionOnScreenOnly)` returns z-order.
+  Only process/click frontmost active table.
+- **"10" detection**: "0" in "10" matches template "8" (score ~0.60). Must check for
+  narrow "1" contour to the left when 8/Q/9/6/T matched with low score.
+- **Hero card 2**: `_identify_card_right` (search_right face detection) is fragile.
+  Fallback `_identify_hero_card2` also unreliable. Both need better face detection.
+- **Engine trigger**: requires `all(gs.hero_cards)` — both cards non-None. If card 2
+  detection fails intermittently, engine never runs. Consider running engine with
+  partial card info or using last-known good cards.
+- **Suit detection**: Prism uses rank text color (4-color deck). Daisy uses corner pip.
+  For PC rewrite, calibrate suit pip location for the chosen deck style.
+- **Vision OCR quirks**: 2x upscale needed for reliable reads. "3"→"2", "BB"→"BR"
+  misreads at native resolution. Decimal points lost in small text. Windows OCR may
+  have different quirks — test early.
+- **Templates at 40px height**: all 13 ranks are 15-22px wide. IoU scoring works well
+  when characters are clean; fails with noisy/pixelated extraction.
 
 ## File Structure
 ```

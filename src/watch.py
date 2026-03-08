@@ -336,11 +336,12 @@ class TableState:
         preflop = self.tracker.preflop_action
 
         solver_inputs = None
+        solver_exc = None
         if gs.board and len(gs.board) >= 3:
             try:
                 solver_inputs = self.tracker.get_solver_inputs(gs, self.rl)
-            except Exception:
-                pass
+            except Exception as e:
+                solver_exc = str(e)
 
         # Invalidate stale solver result on street change
         board_len = len(gs.board) if gs.board else 0
@@ -359,6 +360,22 @@ class TableState:
 
         # Get solver result if available
         solver_result = self.engine.get_result()
+
+        # Log engine block reason for debugging
+        if self.engine.status == "idle" and hero_has_action and board_len >= 4:
+            reasons = []
+            if solver_exc:
+                reasons.append("solver_exc:" + solver_exc[:60])
+            if not solver_inputs:
+                reasons.append("no_solver_inputs")
+            if not gs.hero_cards or len(gs.hero_cards) != 2:
+                reasons.append("no_hero_cards")
+            elif not all(gs.hero_cards):
+                reasons.append("hero_cards_partial:{}".format(gs.hero_cards))
+            if solver_inputs and not solver_inputs.get("hero_position"):
+                reasons.append("no_hero_pos")
+            if reasons:
+                sys.stderr.write("[engine-block] {}\n".format(" | ".join(reasons)))
 
         # Build debug info
         debug = {

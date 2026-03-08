@@ -162,7 +162,9 @@ def _extract_char_from_roi(roi: np.ndarray) -> Optional[np.ndarray]:
     # Filter to contours that could be a rank character:
     # - minimum area to skip noise
     # - minimum width/height to skip thin edge strips (card borders)
+    # - max aspect ratio to reject card-border-merged blobs
     roi_h = text_mask.shape[0]
+    roi_w = text_mask.shape[1]
     valid = []
     for c in contours:
         area = cv2.contourArea(c)
@@ -171,7 +173,29 @@ def _extract_char_from_roi(roi: np.ndarray) -> Optional[np.ndarray]:
         bx, by, bw, bh = cv2.boundingRect(c)
         if bw < 8 or bh < 12:
             continue
+        # Rank chars are taller than wide (max w/h ~0.75 for wide chars like Q/8)
+        # Reject border-merged blobs that are too wide
+        if bh > 0 and bw / bh > 0.85:
+            continue
         valid.append(((bx, by, bw, bh), area))
+
+    # If all contours were too wide (border merged), retry with edge trimming:
+    # zero out the leftmost columns of the mask to separate border from text
+    if not valid:
+        trim = max(3, roi_w // 8)
+        trimmed = text_mask.copy()
+        trimmed[:, :trim] = 0
+        contours2, _ = cv2.findContours(trimmed, cv2.RETR_EXTERNAL,
+                                        cv2.CHAIN_APPROX_SIMPLE)
+        for c in contours2:
+            area = cv2.contourArea(c)
+            if area < 30:
+                continue
+            bx, by, bw, bh = cv2.boundingRect(c)
+            if bw < 8 or bh < 12:
+                continue
+            valid.append(((bx, by, bw, bh), area))
+
     if not valid:
         return None
 
@@ -193,6 +217,9 @@ def _extract_char_from_roi(roi: np.ndarray) -> Optional[np.ndarray]:
     target_h = 40
     scale = target_h / h
     new_w = max(1, int(w * scale))
+    # Reject if normalized width is absurdly wide (border artifact survived)
+    if new_w > 32:
+        return None
     return cv2.resize(char_img, (new_w, target_h), interpolation=cv2.INTER_NEAREST)
 
 
