@@ -9,6 +9,7 @@ Button layout (from screenshots):
   Raise slider + amount to the left of presets
 """
 
+import math
 import random
 import sys
 import time
@@ -40,6 +41,71 @@ PRESET_3Q    = Region(0.763, 0.855, 0.040, 0.030)
 PRESET_POT   = Region(0.808, 0.855, 0.040, 0.030)
 PRESET_ALLIN = Region(0.855, 0.855, 0.055, 0.030)
 
+# ── Humanization constants ───────────────────────────────────────────────────
+
+# Coordinate jitter: random offset in pixels from button center
+JITTER_PX = 6
+
+# Reaction delay range (seconds) before first click
+REACTION_MIN = 0.3
+REACTION_MAX = 1.8
+
+# Delay between multi-click actions (preset → confirm)
+INTER_CLICK_MIN = 0.12
+INTER_CLICK_MAX = 0.35
+
+# Mouse trail: probability of doing a curved approach before clicking
+TRAIL_PROBABILITY = 0.3
+TRAIL_STEPS_MIN = 3
+TRAIL_STEPS_MAX = 8
+TRAIL_STEP_DELAY_MIN = 0.008
+TRAIL_STEP_DELAY_MAX = 0.025
+
+
+# ── Mouse movement helpers ───────────────────────────────────────────────────
+
+def _jitter(x, y, px=JITTER_PX):
+    # type: (float, float, int) -> Tuple[float, float]
+    """Add random pixel offset to coordinates."""
+    return (x + random.uniform(-px, px),
+            y + random.uniform(-px, px))
+
+
+def _get_mouse_pos():
+    # type: () -> Tuple[float, float]
+    """Get current mouse position."""
+    event = Quartz.CGEventCreate(None)
+    point = Quartz.CGEventGetLocation(event)
+    return point.x, point.y
+
+
+def _move_to(x, y):
+    # type: (float, float) -> None
+    """Move mouse to position."""
+    point = Quartz.CGPointMake(x, y)
+    move = CGEventCreateMouseEvent(None, kCGEventMouseMoved, point, 0)
+    CGEventPost(kCGHIDEventTap, move)
+
+
+def _mouse_trail(target_x, target_y):
+    # type: (float, float) -> None
+    """Move mouse toward target in a slightly curved path."""
+    start_x, start_y = _get_mouse_pos()
+    steps = random.randint(TRAIL_STEPS_MIN, TRAIL_STEPS_MAX)
+
+    # Random control point for a quadratic bezier curve (slight arc)
+    mid_x = (start_x + target_x) / 2.0 + random.uniform(-40, 40)
+    mid_y = (start_y + target_y) / 2.0 + random.uniform(-30, 30)
+
+    for i in range(1, steps + 1):
+        t = i / float(steps)
+        # Quadratic bezier: B(t) = (1-t)^2*P0 + 2*(1-t)*t*P1 + t^2*P2
+        inv = 1.0 - t
+        bx = inv * inv * start_x + 2 * inv * t * mid_x + t * t * target_x
+        by = inv * inv * start_y + 2 * inv * t * mid_y + t * t * target_y
+        _move_to(bx, by)
+        time.sleep(random.uniform(TRAIL_STEP_DELAY_MIN, TRAIL_STEP_DELAY_MAX))
+
 
 def _region_center(region, win_x, win_y, win_w, win_h):
     # type: (Region, int, int, int, int) -> Tuple[float, float]
@@ -54,15 +120,22 @@ def _region_center(region, win_x, win_y, win_w, win_h):
 def _click_at(x, y):
     # type: (float, float) -> None
     """Click at screen-absolute coordinates using CGEvent."""
-    point = Quartz.CGPointMake(x, y)
-    # Move mouse
-    move = CGEventCreateMouseEvent(None, kCGEventMouseMoved, point, 0)
-    CGEventPost(kCGHIDEventTap, move)
-    time.sleep(0.02)
+    # Apply jitter
+    x, y = _jitter(x, y)
+
+    # Occasionally do a curved mouse trail approach
+    if random.random() < TRAIL_PROBABILITY:
+        _mouse_trail(x, y)
+    else:
+        # Simple move
+        _move_to(x, y)
+        time.sleep(random.uniform(0.015, 0.035))
+
     # Mouse down
+    point = Quartz.CGPointMake(x, y)
     down = CGEventCreateMouseEvent(None, kCGEventLeftMouseDown, point, 0)
     CGEventPost(kCGHIDEventTap, down)
-    time.sleep(0.03 + random.uniform(0.01, 0.04))
+    time.sleep(random.uniform(0.04, 0.10))
     # Mouse up
     up = CGEventCreateMouseEvent(None, kCGEventLeftMouseUp, point, 0)
     CGEventPost(kCGHIDEventTap, up)
@@ -279,8 +352,8 @@ class Clicker:
         # type: (str, Optional[float], dict, Optional[dict]) -> bool
         """Perform the actual click(s) for an action type."""
         aa = available_actions or {}
-        # Small human-like delay
-        time.sleep(random.uniform(0.15, 0.40))
+        # Human-like reaction delay (varies widely)
+        time.sleep(random.uniform(REACTION_MIN, REACTION_MAX))
 
         if action_type == "fold":
             _click_region(FOLD_BUTTON, bounds)
@@ -300,7 +373,7 @@ class Clicker:
         elif action_type == "allin":
             # Click All-In preset, then click Raise/Bet button
             _click_region(PRESET_ALLIN, bounds)
-            time.sleep(random.uniform(0.10, 0.25))
+            time.sleep(random.uniform(INTER_CLICK_MIN, INTER_CLICK_MAX))
             _click_region(RAISE_BET_BUTTON, bounds)
             return True
 
@@ -309,7 +382,7 @@ class Clicker:
                 # Click the sizing preset that best matches the solver %
                 preset = _pick_preset_for_bet(bet_pct)
                 _click_region(preset, bounds)
-                time.sleep(random.uniform(0.10, 0.25))
+                time.sleep(random.uniform(INTER_CLICK_MIN, INTER_CLICK_MAX))
             # Click the Raise/Bet button to confirm
             _click_region(RAISE_BET_BUTTON, bounds)
             return True
