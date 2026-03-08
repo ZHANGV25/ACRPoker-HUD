@@ -247,6 +247,15 @@ def _read_rank(card_img: np.ndarray) -> Optional[str]:
         if _has_one_digit_left(rank_roi, char_norm):
             return 'T'
 
+    # Disambiguate Q/9: Q and 9 have similar circular shapes.
+    # If Q was matched but there's no "1" digit (not a 10), check if 9 scores close.
+    if rank == 'Q':
+        nine_score = _match_rank_single(char_norm, '9')
+        if score - nine_score < 0.08:
+            # Scores are close — use ink distribution: 9 has bulk at top, Q has
+            # a more vertically centered/bottom-heavy shape with a tail.
+            rank = _disambiguate_Q_9(char_norm)
+
     # Disambiguate 6/9 if needed
     if rank in ('6', '9') and score < 0.95:
         other = '6' if rank == '9' else '9'
@@ -335,6 +344,36 @@ def _disambiguate_6_9(char_img: np.ndarray) -> str:
     bottom_ink = cv2.countNonZero(char_img[rh // 2:, :])
 
     return '9' if top_ink > bottom_ink else '6'
+
+
+def _disambiguate_Q_9(char_img: np.ndarray) -> str:
+    """Distinguish Q from 9 by ink distribution.
+
+    A '9' has its closed loop at the top with a descending tail (top-heavy).
+    A 'Q' has a large circular body that spans more evenly, with a tail at
+    bottom-right. The key difference: 9's bottom quarter has very little ink
+    (just the thin tail), while Q's bottom quarter has the tail plus the
+    bottom of the circle.
+
+    Args:
+        char_img: Binary image (white on black), 40px height.
+    """
+    rh = char_img.shape[0]
+    rw = char_img.shape[1]
+
+    # Compare ink in top 40% vs bottom 40%
+    top_ink = cv2.countNonZero(char_img[:int(rh * 0.4), :])
+    bottom_ink = cv2.countNonZero(char_img[int(rh * 0.6):, :])
+
+    # 9 is very top-heavy: top ink >> bottom ink
+    # Q is more balanced: both top and bottom have significant ink
+    if bottom_ink == 0:
+        return '9'
+    ratio = top_ink / max(bottom_ink, 1)
+
+    # 9 typically has ratio > 2.0 (bulk at top, thin tail at bottom)
+    # Q typically has ratio < 2.0 (circle extends through bottom)
+    return '9' if ratio > 1.8 else 'Q'
 
 
 def _disambiguate_5_6(char_img: np.ndarray) -> str:
@@ -804,6 +843,12 @@ def _identify_card_right(card_img: np.ndarray,
     if rank == 'Q' or (rank in ('9', '6', 'T') and score < 0.90):
         if _has_one_digit_left(rank_roi, char_norm):
             rank = 'T'
+
+    # Disambiguate Q/9 for hero cards too
+    if rank == 'Q':
+        nine_score = _match_rank_single(char_norm, '9')
+        if score - nine_score < 0.08:
+            rank = _disambiguate_Q_9(char_norm)
 
     # Try rank text color for suit (most reliable for 4-color deck)
     suit = _suit_from_rank_color(rank_roi, four_color=four_color)

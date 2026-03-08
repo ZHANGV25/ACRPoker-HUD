@@ -6,6 +6,7 @@ import os
 import random
 import time
 import threading
+from typing import Tuple
 
 sys.path.insert(0, os.path.dirname(__file__))
 
@@ -33,6 +34,7 @@ from solver.exploitative import adjust_advice, adjust_solver_ranges
 POLL_INTERVAL = 1.0
 HERO_NAME = "vortexted"
 HERO_SEAT = 5  # ACR always puts hero at seat 5
+MIN_ACTION_INTERVAL = 0.3  # seconds between quick action checks when idle
 
 # ─── Colors ───────────────────────────────────────────────────────────────────
 
@@ -146,6 +148,30 @@ class StyledText:
         return result
 
 
+# ─── Quick Action Check ───────────────────────────────────────────────────────
+
+def _quick_has_action(img):
+    # type: (np.ndarray) -> bool
+    """Quick check: does hero have action buttons visible?
+
+    Only OCRs the 3 action button regions (~200ms vs ~1000ms full pipeline).
+    Used to skip full OCR when it's not hero's turn.
+    """
+    from src.regions import (
+        FOLD_BUTTON, CALL_CHECK_BUTTON, RAISE_BET_BUTTON, extract_table_area,
+    )
+    from src.vision_ocr import read_action_buttons
+    cropped = extract_table_area(img)
+    buttons = read_action_buttons(
+        FOLD_BUTTON.crop(cropped),
+        CALL_CHECK_BUTTON.crop(cropped),
+        RAISE_BET_BUTTON.crop(cropped),
+    )
+    return bool(buttons and (
+        buttons.get("fold") or buttons.get("check") or
+        buttons.get("call") is not None))
+
+
 # ─── Frame Processor ──────────────────────────────────────────────────────────
 
 def _action_color(action_name):
@@ -166,8 +192,8 @@ def _bar_str(pct, width=15):
 
 def process_frame(img, tracker, smoother, engine, rl, name_cache,
                   hh_watcher, action_picker, table_name=""):
-    # type: (...) -> StyledText
-    """Process one frame and return styled text for the overlay."""
+    # type: (...) -> Tuple[StyledText, bool]
+    """Process one frame and return (styled_text, hero_has_action)."""
     t0 = time.time()
     gs = process_screenshot(img)
     ocr_ms = (time.time() - t0) * 1000
@@ -319,15 +345,23 @@ def process_frame(img, tracker, smoother, engine, rl, name_cache,
         if p.is_folded:
             action = "FOLD"
 
+        bet_str = ""
+        if p.current_bet_bb is not None and p.current_bet_bb > 0:
+            bet_str = " b{:.1f}".format(p.current_bet_bb)
+
         if p.is_hero:
             st.add("  {:<4}".format(pos), FONT_SMALL, CLR_HERO)
             st.add("{:<12}".format(name), FONT_SMALL, CLR_HERO)
             st.add("{:>6}".format(stack), FONT_SMALL, CLR_HERO)
+            if bet_str:
+                st.add(bet_str, FONT_SMALL, CLR_HERO)
             st.add(" \u25c0", FONT_SMALL, CLR_HERO)
         else:
             st.add("  {:<4}".format(pos), FONT_SMALL, CLR_DIM)
             st.add("{:<12}".format(name), FONT_SMALL, CLR_TEXT)
             st.add("{:>6}".format(stack), FONT_SMALL, CLR_DIM)
+            if bet_str:
+                st.add(bet_str, FONT_SMALL, CLR_YELLOW)
 
             # Player stats
             if hh_watcher and p.name:
@@ -349,6 +383,7 @@ def process_frame(img, tracker, smoother, engine, rl, name_cache,
     hero_ocr_on = hero_has_action or bool(smoother._hero_locked)
 
     debug_parts = ["{}ms".format(int(ocr_ms))]
+    debug_parts.append("dlr:{}".format(gs.dealer_seat or "?"))
     if status == "done" and engine.last_solve_time:
         debug_parts.append("solve:{:.1f}s".format(engine.last_solve_time))
     elif status != "idle":
@@ -391,7 +426,7 @@ def process_frame(img, tracker, smoother, engine, rl, name_cache,
             st.add("  {}".format(ps.archetype), FONT_SMALL, arch_color)
             st.nl()
 
-    return st
+    return st, hero_has_action
 
 
 def _render_preflop(st, gs, positions, rl, hh_watcher):
@@ -545,12 +580,12 @@ def _capture_settled():
     img1 = capture_window(win["id"])
     if img1 is None:
         return None, title, table_name
-    time.sleep(0.12)
+    time.sleep(0.25)
     img2 = capture_window(win["id"])
     if img2 is None or img1.shape != img2.shape:
         return None, title, table_name
     diff = np.mean(np.abs(img1.astype(float) - img2.astype(float)))
-    if diff > 5.0:
+    if diff > 3.0:
         return None, title, table_name
     return img2, title, table_name
 
@@ -610,6 +645,7 @@ class OverlayDelegate(AppKit.NSObject):
     @objc.python_method
     def _worker(self):
         name_cache = {}
+        last_had_action = False
         while True:
             try:
                 img, title, table_name = _capture_settled()
@@ -619,8 +655,11 @@ class OverlayDelegate(AppKit.NSObject):
                     st.line("  Waiting for table...", FONT_HEADER, CLR_DIM)
                     if title:
                         st.line("  {}".format(title), FONT_SMALL, CLR_DIM)
+                    last_had_action = False
                 else:
-                    st = process_frame(
+                    # Window is only open when hero has action (MTM auto-stacks).
+                    # Always run full pipeline.
+                    st, had_action = process_frame(
                         img, self.tracker, self.smoother, self.engine,
                         self.rl, name_cache, self.hh_watcher, self.action_picker,
                         table_name=table_name)

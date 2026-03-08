@@ -98,10 +98,10 @@ class ReadingSmoother:
             self._current_board_len = board_len
 
         # Hero cards: only accumulate/lock when hero has action (view is big)
-        # Skip first 2 frames after action appears (view may still be transitioning)
+        # Skip first frame after action appears (settle check filters animations)
         if not hero_has_action:
             self._hero_action_skip = 0
-        elif self._hero_action_skip < 2:
+        elif self._hero_action_skip < 1:
             self._hero_action_skip += 1
             gs.hero_cards = None
 
@@ -607,13 +607,13 @@ def _capture_settled(window_id):
     if img is None:
         return None
 
-    time.sleep(0.15)
+    time.sleep(0.25)
     img2 = capture_window(window_id)
     if img2 is None or img.shape != img2.shape:
         return None
 
     diff = np.mean(np.abs(img.astype(float) - img2.astype(float)))
-    if diff > 5.0:
+    if diff > 3.0:
         return None
 
     return img2

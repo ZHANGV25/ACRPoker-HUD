@@ -140,6 +140,7 @@ def preflop_advice(hero_cards, hero_pos, game_state, rl):
     opener_pos = None
     opener_bet = 0.0
     three_bettor_pos = None
+    three_bet_amount = 0.0
     for p in game_state.players:
         if p.is_sitting_out or p.is_folded:
             continue
@@ -150,41 +151,52 @@ def preflop_advice(hero_cards, hero_pos, game_state, rl):
         is_blind_raise = (pos == "SB" and bet > 0.5) or (pos == "BB" and bet > 1.0)
 
         if is_raise or is_blind_raise:
-            if opener_pos and bet > opener_bet:
-                three_bettor_pos = pos
+            if opener_pos:
+                # Only count as 3-bet if bet is significantly larger than opener's.
+                # A 3-bet is typically >= 2.5x the open. If opener_bet is unknown (0),
+                # require a minimum of 5 BB to distinguish from a flat call.
+                min_3bet = max(opener_bet * 1.8, 5.0) if opener_bet > 0 else 5.0
+                if bet >= min_3bet:
+                    three_bettor_pos = pos
+                    three_bet_amount = bet
             elif not opener_pos:
                 opener_pos = pos
                 opener_bet = bet
 
-    # If we still can't find opener but hero has a Call option > 1 BB, someone raised.
-    # Cross-validate: at least one non-blind player must have a bet > 1 BB to confirm.
-    # (OCR can misread "0.5" as "5.0", creating phantom raises)
+    # Estimate opener_bet from call button when OCR missed the bet amount
     aa = game_state.available_actions or {}
     call_amt = aa.get("call")
-    if not opener_pos and call_amt is not None and call_amt > 1.0:
-        # Verify a non-blind player actually has a raised bet
-        has_raiser_bet = False
+    if opener_pos and opener_bet < 1.5 and call_amt is not None and call_amt > 0:
+        # Hero's call amount + hero's existing bet = total to match the open
+        hero_bet = 0.0
         for p in game_state.players:
-            if p.is_sitting_out or p.is_folded or p.is_hero:
-                continue
-            pos = positions.get(p.seat, "")
-            bet = p.current_bet_bb or 0
-            if pos not in ("SB", "BB") and bet > 1.0:
-                has_raiser_bet = True
+            if p.is_hero:
+                hero_bet = p.current_bet_bb or 0
                 break
-            if pos == "BB" and bet > 1.0:
-                has_raiser_bet = True
-                break
-        if has_raiser_bet:
-            for pos_name in PREFLOP_ORDER:
-                for p in game_state.players:
-                    if p.is_sitting_out or p.is_folded or p.is_hero:
-                        continue
-                    if positions.get(p.seat) == pos_name:
+        opener_bet = call_amt + hero_bet
+
+    # Last-resort fallback: if hero has a Call option > 1 BB, someone definitely raised
+    # even if we can't identify who. Use call amount as the open size.
+    if not opener_pos and call_amt is not None and call_amt > 1.0:
+        # Find the earliest-position non-folded non-hero player as likely opener
+        for pos_name in PREFLOP_ORDER:
+            for p in game_state.players:
+                if p.is_sitting_out or p.is_folded or p.is_hero:
+                    continue
+                if positions.get(p.seat) == pos_name:
+                    action = (p.action_label or "").upper()
+                    bet = p.current_bet_bb or 0
+                    if bet > 1.0 or action in ("R", "R/B", "RAISE"):
                         opener_pos = pos_name
+                        opener_bet = bet if bet > 1.5 else call_amt + 1.0
                         break
-                if opener_pos:
-                    break
+            if opener_pos:
+                break
+        # If still no specific raiser found but call button proves a raise exists,
+        # just mark "unknown" opener so we don't give wrong "CHECK" advice
+        if not opener_pos:
+            opener_pos = "?"
+            opener_bet = call_amt + 1.0
 
     # Scenario 1: No one has raised yet — hero should RFI?
     if not opener_pos:
@@ -194,7 +206,7 @@ def preflop_advice(hero_cards, hero_pos, game_state, rl):
                 return "CHECK  (BB with no raise)"
             return None
         if _hand_in_range(combo, rfi_range):
-            return "RAISE  {} in {}'s open range".format(combo, hero_pos)
+            return "RAISE  {} in {}'s open range (to 2.5 BB)".format(combo, hero_pos)
         else:
             return "FOLD   {} not in {}'s open range".format(combo, hero_pos)
 
@@ -207,7 +219,15 @@ def preflop_advice(hero_cards, hero_pos, game_state, rl):
         in_call = _hand_in_range(combo, call_range) if call_range else False
 
         if in_3bet:
-            return "3-BET  {} vs {} open".format(combo, opener_pos)
+            # 3-bet sizing: ~3x open IP, ~3.5x open OOP (SB uses 4x)
+            open_size = opener_bet if opener_bet > 1.5 else 2.5
+            if hero_pos == "SB":
+                three_bet_size = round(open_size * 4.0, 1)
+            elif hero_pos == "BB":
+                three_bet_size = round(open_size * 3.5, 1)
+            else:
+                three_bet_size = round(open_size * 3.0, 1)
+            return "3-BET  {} vs {} open (to {:.1f} BB)".format(combo, opener_pos, three_bet_size)
         elif in_call:
             return "CALL   {} vs {} open".format(combo, opener_pos)
         else:
@@ -222,11 +242,31 @@ def preflop_advice(hero_cards, hero_pos, game_state, rl):
         in_call = _hand_in_range(combo, call_range) if call_range else False
 
         if in_4bet:
-            return "4-BET  {} vs 3bet".format(combo)
+            # 4-bet sizing: ~2.2-2.5x the 3-bet size
+            tb_size = three_bet_amount if three_bet_amount > 3.0 else 8.0
+            four_bet_size = round(tb_size * 2.3, 1)
+            return "4-BET  {} vs 3bet (to {:.1f} BB)".format(combo, four_bet_size)
         elif in_call:
             return "CALL   {} vs 3bet".format(combo)
         else:
             return "FOLD   {} vs 3bet".format(combo)
+
+    # Scenario 4: There's a 3bet — hero was NOT the opener (cold vs 3bet).
+    # Very tight range: only premium hands can cold 4-bet or cold call a 3-bet.
+    if three_bettor_pos and hero_pos != opener_pos:
+        # Use the vs_rfi 3bet range as a proxy for cold 4-bet range
+        four_bet_range = rl.vs_rfi(hero_pos, opener_pos, "3bet")
+        in_4bet = _hand_in_range(combo, four_bet_range) if four_bet_range else False
+
+        if in_4bet:
+            tb_size = three_bet_amount if three_bet_amount > 3.0 else 8.0
+            four_bet_size = round(tb_size * 2.3, 1)
+            return "4-BET  {} cold vs {} 3bet (to {:.1f} BB)".format(
+                combo, three_bettor_pos, four_bet_size)
+        # Premium pairs can cold call
+        if combo in ("AA", "KK", "QQ", "JJ", "TT", "AKs", "AKo", "AQs"):
+            return "CALL   {} cold call vs {} 3bet".format(combo, three_bettor_pos)
+        return "FOLD   {} vs {}'s 3bet (cold)".format(combo, three_bettor_pos)
 
     return None
 
