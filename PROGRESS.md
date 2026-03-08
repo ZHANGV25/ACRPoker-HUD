@@ -113,7 +113,9 @@ Parse ACR hand history files for accurate player stat tracking.
 - OCR occasionally misreads decimals (e.g. "0.5" -> "5.0")
 - Board card turn/river order occasionally swaps (rare)
 
-## TODO: Windows/PC Rewrite
+## TODO
+
+### 1. Rewrite for Windows/PC
 The Mac pipeline works end-to-end but card OCR is unreliable at small table sizes
 (~467px wide on Mac). Moving to a PC with a bigger monitor + cleaner card deck is
 the right long-term fix. The core logic is cross-platform; only I/O layers need rewriting.
@@ -178,6 +180,20 @@ the right long-term fix. The core logic is cross-platform; only I/O layers need 
   have different quirks — test early.
 - **Templates at 40px height**: all 13 ranks are 15-22px wide. IoU scoring works well
   when characters are clean; fails with noisy/pixelated extraction.
+
+### 2. Test everything on PC with new deck
+- Use **Daisy** card style (clean separate corner text)
+- Regenerate all 13 rank templates at bigger resolution
+- Recalibrate suit pip positions for Daisy layout
+- Verify board card detection, hero card 1 + 2, suit detection all work
+- Test multi-table, clicker, smoother lock behavior at new resolution
+
+### 3. Pre-solve all flop textures
+- Currently flop is skipped (too slow for live play — solver times out)
+- ~1,755 strategically unique flop textures (suit isomorphism reduces from 22,100)
+- Pre-compute solver outputs for all flop textures offline, store in a lookup DB
+- At runtime, look up the flop solution instantly instead of solving live
+- This gives full flop+turn+river GTO coverage
 
 ## File Structure
 ```
